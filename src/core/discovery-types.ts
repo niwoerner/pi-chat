@@ -6,6 +6,7 @@ export interface AccountIdentity {
 	userName?: string;
 	workspaceId?: string;
 	workspaceName?: string;
+	workspaceDomain?: string;
 }
 
 export interface DiscoveredChannel {
