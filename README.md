@@ -1,6 +1,6 @@
 # pi-chat
 
-A pi extension that bridges Discord and Telegram channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
+A pi extension that bridges Discord, Telegram, and Slack channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
 
 ## Quick Start
 
@@ -21,13 +21,13 @@ pi -e /path/to/pi-chat
 
 - [QEMU](https://www.qemu.org/) installed (`brew install qemu` on macOS)
 - Gondolin guest image (downloaded automatically on first connect)
-- A Discord bot token or Telegram bot token
+- A Discord bot token, Telegram bot token, or Slack app (bot + app-level tokens)
 
 ---
 
 ## Features
 
-- **Discord server channels** and **Telegram DMs/groups**
+- **Discord server channels**, **Telegram DMs/groups**, and **Slack channels/DMs** (Socket Mode)
 - **Gondolin VM sandbox** per connection — tools run inside an isolated Alpine Linux micro-VM
 - **Persistent workspace** and **shared storage** across sessions
 - **Streamed preview** responses with edit-in-place
@@ -58,6 +58,19 @@ pi -e /path/to/pi-chat
 2. Run `/chat-config` → Create account → Telegram
 3. Enter your bot token
 4. Add DMs or groups through the guided setup
+
+### Slack
+
+1. Create a Slack app at https://api.slack.com/apps using **Create New App → From an app manifest**.
+2. Paste the included [`slack-app-manifest.yaml`](./slack-app-manifest.yaml). Adjust the app name/display name if desired.
+3. Install the app to your workspace and copy the **Bot User OAuth Token** (`xoxb-...`).
+4. In **Basic Information → App-Level Tokens**, generate an app-level token with `connections:write`; copy the token (`xapp-...`).
+5. Run `/chat-config` → Create account → Slack. Paste the `xoxb-...` bot token and `xapp-...` app token.
+6. Invite the bot to any Slack channels you want to use, then select Slack channels/DMs to configure.
+
+Slack uses Socket Mode, so no public HTTP endpoint or Request URL is needed. The included manifest enables the App Home messages tab for DMs. Bot replies are threaded by default: pi-chat responds inside the triggering message's thread.
+
+Required bot scopes/events are captured in `slack-app-manifest.yaml`; if you add scopes later, reinstall the Slack app before refreshing channels in `/chat-config`.
 
 ---
 
