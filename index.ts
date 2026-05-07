@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { type Dirent, constants as fsConstants } from "node:fs";
+import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { basename, extname, isAbsolute, join, relative } from "node:path";
 import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
@@ -12,19 +14,20 @@ import {
 	createReadToolDefinition,
 	createWriteTool,
 	createWriteToolDefinition,
-	formatSkillsForPrompt,
-	loadSkillsFromDir,
+	SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
 	CHAT_CONFIG_PATH,
+	CHAT_HOME,
 	ensureChatHome,
 	listConfiguredConversations,
 	loadChatConfig,
 	resolveConversation,
 } from "./src/config.js";
 
+import type { ResolvedConversation } from "./src/core/config-types.js";
 import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
 import { connectLive } from "./src/live/index.js";
 import type { LiveConnection } from "./src/live/types.js";
@@ -89,6 +92,296 @@ type PersistedChatState = {
 };
 
 const SESSION_STATE_CUSTOM_TYPE = "pi-chat-state";
+const CHAT_CONVERSATION_FLAG = "chat-conversation";
+const WORKER_TMUX_PREFIX = "pi-chat-worker-";
+const DASHBOARD_TMUX_SESSION = "pi-chat-dashboard";
+const WORKER_STATUS_DIR = join(CHAT_HOME, "worker-status");
+
+interface WorkerStatusSnapshot {
+	conversationId: string;
+	conversationName: string;
+	service: string;
+	pid: number;
+	cwd: string;
+	sessionFile?: string;
+	tmuxSession: string;
+	state: "connected" | "error";
+	updatedAt: string;
+	model?: string;
+	thinking?: string;
+	contextPercent?: number | null;
+	queueLength: number;
+	hasActiveJob: boolean;
+	chatTurnInFlight: boolean;
+	recordCount: number;
+	lastRecordId: number;
+	lastError?: string;
+}
+
+interface ChatPromptSkill {
+	name: string;
+	description: string;
+	filePath: string;
+}
+
+function isInsideHostPath(root: string, value: string): boolean {
+	const rel = relative(root, value);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+function escapeXml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&apos;");
+}
+
+async function safeReadMountedText(root: string, filePath: string): Promise<string> {
+	try {
+		const realRoot = await realpath(root);
+		const resolvedPath = await realpath(filePath);
+		if (!isInsideHostPath(realRoot, resolvedPath)) return "";
+		const handle = await open(resolvedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+		try {
+			const info = await handle.stat();
+			if (!info.isFile()) return "";
+			return await handle.readFile("utf8");
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return "";
+	}
+}
+
+function parseSkillFrontmatter(content: string): { name?: string; description?: string; disabled?: boolean } {
+	const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+	if (!match) return {};
+	const frontmatter: { name?: string; description?: string; disabled?: boolean } = {};
+	for (const line of match[1].split(/\r?\n/)) {
+		const separator = line.indexOf(":");
+		if (separator <= 0) continue;
+		const key = line.slice(0, separator).trim();
+		const rawValue = line
+			.slice(separator + 1)
+			.trim()
+			.replace(/^['"]|['"]$/g, "");
+		if (key === "name") frontmatter.name = rawValue;
+		if (key === "description") frontmatter.description = rawValue;
+		if (key === "disable-model-invocation") frontmatter.disabled = rawValue === "true";
+	}
+	return frontmatter;
+}
+
+async function loadSafeChatSkills(root: string): Promise<ChatPromptSkill[]> {
+	const skillsRoot = join(root, "skills");
+	const skills: ChatPromptSkill[] = [];
+	async function addSkill(filePath: string, defaultName: string): Promise<void> {
+		const content = await safeReadMountedText(root, filePath);
+		const frontmatter = parseSkillFrontmatter(content);
+		if (!frontmatter.description?.trim() || frontmatter.disabled) return;
+		skills.push({ name: frontmatter.name || defaultName, description: frontmatter.description, filePath });
+	}
+	async function walkSkills(dir: string, depth: number): Promise<void> {
+		if (depth > 8) return;
+		let entries: Dirent<string>[];
+		try {
+			entries = await readdir(dir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+		for (const entry of entries) {
+			if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
+			const fullPath = join(dir, entry.name);
+			if (entry.isFile() && extname(entry.name).toLowerCase() === ".md") {
+				await addSkill(fullPath, basename(entry.name, ".md"));
+				continue;
+			}
+			if (!entry.isDirectory()) continue;
+			const skillMd = join(fullPath, "SKILL.md");
+			try {
+				const info = await lstat(skillMd);
+				if (info.isFile()) {
+					await addSkill(skillMd, entry.name);
+					continue;
+				}
+			} catch {
+				// Not a skill root; recurse below.
+			}
+			await walkSkills(fullPath, depth + 1);
+		}
+	}
+	await walkSkills(skillsRoot, 0);
+	return skills;
+}
+
+function formatChatSkillsForPrompt(skills: ChatPromptSkill[]): string {
+	if (skills.length === 0) return "";
+	const lines = [
+		"\n\nThe following skills provide specialized instructions for specific tasks.",
+		"Use the read tool to load a skill's file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"",
+		"<available_skills>",
+	];
+	for (const skill of skills) {
+		lines.push("  <skill>");
+		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
+		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
+		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		lines.push("  </skill>");
+	}
+	lines.push("</available_skills>");
+	return lines.join("\n");
+}
+
+function tmuxSafeName(value: string): string {
+	const safe = value.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "channel";
+	return `${WORKER_TMUX_PREFIX}${safe}`.slice(0, 100);
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
+function explicitExtensionCommandParts(): string[] {
+	const parts: string[] = [];
+	for (let i = 0; i < process.argv.length; i++) {
+		const arg = process.argv[i];
+		if ((arg === "-e" || arg === "--extension") && process.argv[i + 1]) {
+			parts.push(arg, shellQuote(process.argv[++i]));
+		} else if (arg.startsWith("--extension=")) {
+			parts.push("--extension", shellQuote(arg.slice("--extension=".length)));
+		}
+	}
+	return parts;
+}
+
+function ensureTmux(): void {
+	const result = spawnSync("tmux", ["-V"], { encoding: "utf8" });
+	if (result.error || result.status !== 0) throw new Error("tmux not found. Install tmux and try again.");
+}
+
+function tmuxSessionExists(name: string): boolean {
+	return spawnSync("tmux", ["has-session", "-t", name], { stdio: "ignore" }).status === 0;
+}
+
+function listTmuxSessions(): Set<string> {
+	const result = spawnSync("tmux", ["list-sessions", "-F", "#S"], { encoding: "utf8" });
+	if (result.error || result.status !== 0) return new Set();
+	return new Set(result.stdout.split(/\r?\n/).filter(Boolean));
+}
+
+function managedWorkerSessions(): string[] {
+	return [...listTmuxSessions()].filter((name) => name.startsWith(WORKER_TMUX_PREFIX)).sort();
+}
+
+function killManagedTmuxSessions(): string[] {
+	const killed: string[] = [];
+	for (const name of managedWorkerSessions()) {
+		spawnSync("tmux", ["kill-session", "-t", name], { stdio: "ignore" });
+		killed.push(name);
+	}
+	return killed;
+}
+
+function workerStatusPath(conversationId: string): string {
+	return join(WORKER_STATUS_DIR, `${tmuxSafeName(conversationId)}.json`);
+}
+
+async function readWorkerStatus(conversationId: string): Promise<WorkerStatusSnapshot | undefined> {
+	try {
+		return JSON.parse(await readFile(workerStatusPath(conversationId), "utf8")) as WorkerStatusSnapshot;
+	} catch {
+		return undefined;
+	}
+}
+
+function formatStatusAge(updatedAt?: string): string {
+	if (!updatedAt) return "no status";
+	const ageMs = Date.now() - Date.parse(updatedAt);
+	if (!Number.isFinite(ageMs) || ageMs < 0) return updatedAt;
+	const seconds = Math.round(ageMs / 1000);
+	if (seconds < 60) return `${seconds}s ago`;
+	const minutes = Math.round(seconds / 60);
+	if (minutes < 60) return `${minutes}m ago`;
+	const hours = Math.round(minutes / 60);
+	return `${hours}h ago`;
+}
+
+async function formatWorkerStatus(conversations: ResolvedConversation[]): Promise<string> {
+	const sessions = listTmuxSessions();
+	const lines: string[] = [];
+	for (const conversation of conversations) {
+		const tmuxName = tmuxSafeName(conversation.conversationId);
+		const snapshot = await readWorkerStatus(conversation.conversationId);
+		const running = sessions.has(tmuxName);
+		const state = snapshot?.lastError ? `error: ${snapshot.lastError}` : (snapshot?.state ?? "unknown");
+		const queue = snapshot ? `q:${snapshot.queueLength}${snapshot.chatTurnInFlight ? " active" : ""}` : "q:?";
+		const model = snapshot?.model ? ` ${snapshot.model}` : "";
+		lines.push(
+			`${running ? "●" : "○"} ${conversation.conversationName} — ${state}, ${queue}, ${formatStatusAge(snapshot?.updatedAt)}${model}\n  ${tmuxName}`,
+		);
+	}
+	return lines.join("\n");
+}
+
+function runTmux(args: string[]): void {
+	const result = spawnSync("tmux", args, { encoding: "utf8" });
+	if (result.error || result.status !== 0)
+		throw new Error(result.stderr.trim() || result.error?.message || "tmux failed");
+}
+
+function createDashboardTmux(): string {
+	const workers = managedWorkerSessions();
+	if (workers.length === 0) throw new Error("No managed pi-chat workers are running.");
+	if (tmuxSessionExists(DASHBOARD_TMUX_SESSION)) {
+		spawnSync("tmux", ["kill-session", "-t", DASHBOARD_TMUX_SESSION], { stdio: "ignore" });
+	}
+	const attachCommand = (name: string) => `exec env -u TMUX tmux attach-session -t ${shellQuote(name)}`;
+	runTmux(["new-session", "-d", "-s", DASHBOARD_TMUX_SESSION, "-n", "chats", attachCommand(workers[0])]);
+	for (const worker of workers.slice(1)) {
+		runTmux(["split-window", "-t", `${DASHBOARD_TMUX_SESSION}:chats`, attachCommand(worker)]);
+	}
+	runTmux(["select-layout", "-t", `${DASHBOARD_TMUX_SESSION}:chats`, "tiled"]);
+	if (process.env.TMUX) runTmux(["switch-client", "-t", DASHBOARD_TMUX_SESSION]);
+	return DASHBOARD_TMUX_SESSION;
+}
+
+function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConversation, restart: boolean): string {
+	const tmuxName = tmuxSafeName(conversation.conversationId);
+	if (restart && tmuxSessionExists(tmuxName)) spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "ignore" });
+	if (tmuxSessionExists(tmuxName)) return `${conversation.conversationName}: already running (${tmuxName})`;
+
+	const sessionDir = join(CHAT_HOME, "tmux-sessions", tmuxName);
+	const session = SessionManager.continueRecent(ctx.cwd, sessionDir);
+	session.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId: conversation.conversationId });
+	session.appendSessionInfo(`pi-chat ${conversation.conversationName}`);
+	const sessionFile = session.getSessionFile();
+	if (!sessionFile) throw new Error(`Could not create pi session for ${conversation.conversationName}`);
+
+	const command = [
+		"exec pi",
+		"--session",
+		shellQuote(sessionFile),
+		"--session-dir",
+		shellQuote(sessionDir),
+		...explicitExtensionCommandParts(),
+		`--${CHAT_CONVERSATION_FLAG}`,
+		shellQuote(conversation.conversationId),
+	].join(" ");
+	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", ctx.cwd, command], {
+		encoding: "utf8",
+	});
+	if (result.error || result.status !== 0) {
+		throw new Error(
+			result.stderr.trim() || result.error?.message || `tmux failed for ${conversation.conversationName}`,
+		);
+	}
+	return `${conversation.conversationName}: started (${tmuxName})`;
+}
 
 function abortError(): Error {
 	const error = new Error("aborted");
@@ -136,6 +429,11 @@ function extractAssistantSummary(messages: unknown[]): AssistantSummary {
 }
 
 export default function (pi: ExtensionAPI) {
+	pi.registerFlag(CHAT_CONVERSATION_FLAG, {
+		description: "Auto-connect pi-chat to a configured account/channel",
+		type: "string",
+	});
+
 	let runtime: ConversationRuntime | undefined;
 	let liveConnection: LiveConnection | undefined;
 	let sandbox: ConversationSandbox | undefined;
@@ -143,6 +441,7 @@ export default function (pi: ExtensionAPI) {
 	let chatTurnInFlight = false;
 	let configLoadedAtLeastOnce = false;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
+	let workerStatusInterval: ReturnType<typeof setInterval> | undefined;
 	let queuedOutboundAttachments: string[] = [];
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
@@ -229,8 +528,14 @@ export default function (pi: ExtensionAPI) {
 	async function buildMemoryPromptSuffix(): Promise<string> {
 		if (!runtime) return "";
 		const sections: string[] = [];
-		const accountMemory = await readFile(runtime.conversation.accountMemoryPath, "utf8").catch(() => "");
-		const channelMemory = await readFile(runtime.conversation.channelMemoryPath, "utf8").catch(() => "");
+		const accountMemory = await safeReadMountedText(
+			runtime.conversation.sharedDir,
+			runtime.conversation.accountMemoryPath,
+		);
+		const channelMemory = await safeReadMountedText(
+			runtime.conversation.workspaceDir,
+			runtime.conversation.channelMemoryPath,
+		);
 		if (accountMemory.trim()) sections.push(`Account memory (/shared/memory.md):\n${accountMemory.trim()}`);
 		if (channelMemory.trim()) sections.push(`Channel memory (/workspace/memory.md):\n${channelMemory.trim()}`);
 		if (sections.length === 0) return "";
@@ -251,25 +556,24 @@ export default function (pi: ExtensionAPI) {
 		return hostPath;
 	}
 
-	function buildSkillsPromptSuffix(): string {
+	async function buildSkillsPromptSuffix(): Promise<string> {
 		if (!runtime) return "";
-		const sharedSkills = loadSkillsFromDir({ dir: runtime.conversation.sharedDir, source: "account" });
-		const channelSkills = loadSkillsFromDir({ dir: runtime.conversation.workspaceDir, source: "channel" });
-		const skillMap = new Map<string, (typeof sharedSkills.skills)[number]>();
-		for (const skill of sharedSkills.skills) skillMap.set(skill.name, skill);
-		for (const skill of channelSkills.skills) skillMap.set(skill.name, skill);
-		const allSkills = [...skillMap.values()].map((skill) => ({
-			...skill,
-			filePath: hostToGuestPath(skill.filePath),
-			baseDir: hostToGuestPath(skill.baseDir),
-		}));
-		if (allSkills.length === 0) return "";
-		return `\n\nAvailable skills:\n${formatSkillsForPrompt(allSkills)}`;
+		const sharedSkills = await loadSafeChatSkills(runtime.conversation.sharedDir);
+		const channelSkills = await loadSafeChatSkills(runtime.conversation.workspaceDir);
+		const skillMap = new Map<string, ChatPromptSkill>();
+		for (const skill of sharedSkills) skillMap.set(skill.name, skill);
+		for (const skill of channelSkills) skillMap.set(skill.name, skill);
+		const allSkills = [...skillMap.values()].map((skill) => ({ ...skill, filePath: hostToGuestPath(skill.filePath) }));
+		const formatted = formatChatSkillsForPrompt(allSkills);
+		return formatted ? `\n\nAvailable skills:\n${formatted}` : "";
 	}
 
 	async function buildSystemMdSuffix(): Promise<string> {
 		if (!runtime) return "";
-		const systemMd = await readFile(`${runtime.conversation.workspaceDir}/SYSTEM.md`, "utf8").catch(() => "");
+		const systemMd = await safeReadMountedText(
+			runtime.conversation.workspaceDir,
+			join(runtime.conversation.workspaceDir, "SYSTEM.md"),
+		);
 		if (!systemMd.trim()) return "";
 		return `\n\nSystem configuration log (/workspace/SYSTEM.md):\n${systemMd.trim()}`;
 	}
@@ -451,6 +755,16 @@ export default function (pi: ExtensionAPI) {
 						if (runtime) await runtime.appendError(error.message);
 						updateStatus(ctx, error.message);
 					},
+					onDisconnect: async () => {
+						if (!runtime) return;
+						const cid = runtime.conversation.conversationId;
+						updateStatus(ctx, "disconnected, reconnecting...");
+						if (liveConnection) {
+							await liveConnection.disconnect().catch(() => undefined);
+							liveConnection = undefined;
+						}
+						await connectConversation(ctx, cid, false);
+					},
 				},
 				runtime.getLastCheckpoint(),
 			);
@@ -471,6 +785,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		persistChatState(conversation.conversationId);
+		startWorkerStatusLoop(ctx);
 		if (interactive) ctx.ui.notify(`Connected ${conversation.conversationName}`, "info");
 		await showChatContextMessage();
 		updateStatus(ctx);
@@ -490,9 +805,15 @@ export default function (pi: ExtensionAPI) {
 		const mode = runtime.conversation.channel.dm ? "dm" : "mention";
 		const service = runtime.conversation.service;
 		const systemPromptAdditions = buildChatSystemPromptSuffix(service, mode, channelName).trim();
-		const accountMemory = await readFile(runtime.conversation.accountMemoryPath, "utf8").catch(() => "");
-		const channelMemory = await readFile(runtime.conversation.channelMemoryPath, "utf8").catch(() => "");
-		const skillsSuffix = buildSkillsPromptSuffix();
+		const accountMemory = await safeReadMountedText(
+			runtime.conversation.sharedDir,
+			runtime.conversation.accountMemoryPath,
+		);
+		const channelMemory = await safeReadMountedText(
+			runtime.conversation.workspaceDir,
+			runtime.conversation.channelMemoryPath,
+		);
+		const skillsSuffix = await buildSkillsPromptSuffix();
 		const sections = [`Connected to ${service} ${mode} ${channelName}.`, "", "System prompt:", systemPromptAdditions];
 		if (accountMemory.trim()) sections.push("", "Account memory (/shared/memory.md):", accountMemory.trim());
 		if (channelMemory.trim()) sections.push("", "Channel memory (/workspace/memory.md):", channelMemory.trim());
@@ -500,7 +821,50 @@ export default function (pi: ExtensionAPI) {
 		pi.sendMessage({ customType: "chat-context", content: sections.join("\n"), display: true });
 	}
 
+	async function writeWorkerStatus(ctx: ExtensionContext, error?: string): Promise<void> {
+		if (!runtime) return;
+		const status = runtime.getStatus();
+		const usage = ctx.getContextUsage();
+		const snapshot: WorkerStatusSnapshot = {
+			conversationId: status.conversationId,
+			conversationName: status.conversationName,
+			service: runtime.conversation.service,
+			pid: process.pid,
+			cwd: ctx.cwd,
+			sessionFile: ctx.sessionManager.getSessionFile(),
+			tmuxSession: tmuxSafeName(status.conversationId),
+			state: error ? "error" : "connected",
+			updatedAt: new Date().toISOString(),
+			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			thinking: pi.getThinkingLevel(),
+			contextPercent: usage?.percent,
+			queueLength: status.queueLength,
+			hasActiveJob: status.hasActiveJob,
+			chatTurnInFlight,
+			recordCount: status.recordCount,
+			lastRecordId: status.lastRecordId,
+			lastError: error,
+		};
+		await mkdir(WORKER_STATUS_DIR, { recursive: true });
+		await writeFile(workerStatusPath(status.conversationId), `${JSON.stringify(snapshot, null, "\t")}\n`, "utf8");
+	}
+
+	function startWorkerStatusLoop(ctx: ExtensionContext): void {
+		if (workerStatusInterval) clearInterval(workerStatusInterval);
+		void writeWorkerStatus(ctx).catch(() => undefined);
+		workerStatusInterval = setInterval(() => {
+			void writeWorkerStatus(ctx).catch(() => undefined);
+		}, 15000);
+	}
+
+	function stopWorkerStatusLoop(): void {
+		if (!workerStatusInterval) return;
+		clearInterval(workerStatusInterval);
+		workerStatusInterval = undefined;
+	}
+
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
+		void writeWorkerStatus(ctx, error).catch(() => undefined);
 		const theme = ctx.ui.theme;
 		const label = theme.fg("accent", "chat");
 		if (error) {
@@ -533,6 +897,22 @@ export default function (pi: ExtensionAPI) {
 		}
 		void liveConnection?.stopTyping();
 	}
+
+	pi.registerTool({
+		name: "chat_workers",
+		label: "Chat Workers",
+		description: "Show configured pi-chat worker status from tmux and worker status snapshots.",
+		parameters: Type.Object({}),
+		renderCall(_args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold("chat_workers")), 0, 0);
+		},
+		async execute() {
+			const config = await loadChatConfig();
+			const configured = listConfiguredConversations(config);
+			const body = configured.length > 0 ? await formatWorkerStatus(configured) : "No configured channels.";
+			return { content: [{ type: "text", text: body }], details: { count: configured.length } };
+		},
+	});
 
 	pi.registerTool({
 		name: "chat_history",
@@ -644,10 +1024,7 @@ export default function (pi: ExtensionAPI) {
 			signal?.throwIfAborted?.();
 			for (const path of params.paths) {
 				signal?.throwIfAborted?.();
-				const resolvedPath = sandbox.toAttachmentHostPath(path);
-				const fileStats = await stat(resolvedPath);
-				if (!fileStats.isFile()) throw new Error(`Not a file: ${path}`);
-				queuedOutboundAttachments.push(resolvedPath);
+				queuedOutboundAttachments.push(await sandbox.stageAttachment(path));
 			}
 			return {
 				content: [{ type: "text", text: `Queued ${params.paths.length} attachment(s).` }],
@@ -723,6 +1100,8 @@ export default function (pi: ExtensionAPI) {
 
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
 		stopTypingLoop();
+		stopWorkerStatusLoop();
+		if (runtime) await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
 		const connection = liveConnection;
 		liveConnection = undefined;
 		if (connection) await connection.disconnect().catch(() => undefined);
@@ -795,6 +1174,70 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.ui.notify(configured.map((item) => item.conversationName).join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("chat-spawn-all", {
+		description: "Spawn all configured pi-chat channels in detached tmux sessions",
+		handler: async (args, ctx) => {
+			await loadConfigOnce();
+			ensureTmux();
+			const restart = args.split(/\s+/).includes("--restart");
+			const config = await loadChatConfig();
+			const configured = listConfiguredConversations(config);
+			if (configured.length === 0) {
+				ctx.ui.notify(`No configured channels. Run /chat-config. (${CHAT_CONFIG_PATH})`, "warning");
+				return;
+			}
+			const lines = configured.map((conversation) => spawnConversationTmux(ctx, conversation, restart));
+			ctx.ui.notify(`${lines.join("\n")}\n\nAttach with: tmux attach -t <session>`, "info");
+		},
+	});
+
+	pi.registerCommand("chat-workers", {
+		description: "Show managed pi-chat tmux sessions",
+		handler: async (_args, ctx) => {
+			await loadConfigOnce();
+			ensureTmux();
+			const config = await loadChatConfig();
+			const configured = listConfiguredConversations(config);
+			if (configured.length === 0) {
+				ctx.ui.notify(`No configured channels. Run /chat-config. (${CHAT_CONFIG_PATH})`, "warning");
+				return;
+			}
+			ctx.ui.notify(await formatWorkerStatus(configured), "info");
+		},
+	});
+
+	pi.registerCommand("chat-open-all", {
+		description: "Open all running pi-chat workers in a tiled tmux dashboard",
+		handler: async (_args, ctx) => {
+			await loadConfigOnce();
+			ensureTmux();
+			try {
+				const dashboard = createDashboardTmux();
+				ctx.ui.notify(
+					process.env.TMUX
+						? `Switched to ${dashboard}.`
+						: `Created ${dashboard}. Attach with: tmux attach -t ${dashboard}`,
+					"info",
+				);
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			}
+		},
+	});
+
+	pi.registerCommand("chat-kill-all", {
+		description: "Kill all managed pi-chat tmux sessions",
+		handler: async (_args, ctx) => {
+			await loadConfigOnce();
+			ensureTmux();
+			const killed = killManagedTmuxSessions();
+			ctx.ui.notify(
+				killed.length > 0 ? `Killed:\n${killed.join("\n")}` : "No managed pi-chat tmux sessions running.",
+				"info",
+			);
 		},
 	});
 
@@ -889,10 +1332,24 @@ export default function (pi: ExtensionAPI) {
 				return tool.execute(id, params, signal, onUpdate);
 			},
 		});
-		pi.setActiveTools(["read", "write", "edit", "bash", "chat_history", "chat_attach", "chat_request_secret"]);
+		pi.setActiveTools([
+			"read",
+			"write",
+			"edit",
+			"bash",
+			"chat_history",
+			"chat_attach",
+			"chat_request_secret",
+			"chat_workers",
+		]);
 		updateStatus(ctx);
+		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);
 		const persistedConversationId = getPersistedConversationId(ctx);
-		if (persistedConversationId) await connectConversation(ctx, persistedConversationId, false);
+		const conversationId =
+			typeof flaggedConversationId === "string" && flaggedConversationId.trim()
+				? flaggedConversationId.trim()
+				: persistedConversationId;
+		if (conversationId) await connectConversation(ctx, conversationId, false);
 	});
 
 	pi.on("session_shutdown", async (event, ctx) => {
@@ -924,7 +1381,7 @@ export default function (pi: ExtensionAPI) {
 		const mode = runtime?.conversation.channel.dm ? "dm" : "mention";
 		const service = runtime?.conversation.service ?? "chat";
 		const memorySuffix = await buildMemoryPromptSuffix();
-		const skillsSuffix = buildSkillsPromptSuffix();
+		const skillsSuffix = await buildSkillsPromptSuffix();
 		const systemMdSuffix = await buildSystemMdSuffix();
 		return {
 			systemPrompt:
@@ -958,10 +1415,10 @@ export default function (pi: ExtensionAPI) {
 			await tryDispatch(ctx);
 			return;
 		}
-		if (summary.stopReason === "error") {
+		if (summary.stopReason === "error" || summary.stopReason === "length") {
 			stopTypingLoop();
 			chatTurnInFlight = false;
-			const errorMessage = summary.errorMessage || "agent error";
+			const errorMessage = summary.errorMessage || `agent ${summary.stopReason}`;
 			await runtime.failActiveJob(errorMessage);
 			if (liveConnection) {
 				try {

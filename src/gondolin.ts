@@ -1,4 +1,6 @@
-import { access, readdir, readFile, stat, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants as fsConstants, realpathSync } from "node:fs";
+import { access, mkdir, open, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { createHttpHooks, RealFSProvider, type SecretDefinition, VM } from "@earendil-works/gondolin";
@@ -16,6 +18,12 @@ function toPosix(value: string): string {
 function isInside(root: string, value: string): boolean {
 	const rel = path.relative(root, value);
 	return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+function guestMountRoot(guestPath: string): typeof GONDOLIN_WORKSPACE | typeof GONDOLIN_SHARED | undefined {
+	if (guestPath === GONDOLIN_WORKSPACE || guestPath.startsWith(`${GONDOLIN_WORKSPACE}/`)) return GONDOLIN_WORKSPACE;
+	if (guestPath === GONDOLIN_SHARED || guestPath.startsWith(`${GONDOLIN_SHARED}/`)) return GONDOLIN_SHARED;
+	return undefined;
 }
 
 function resolveSecretEnvironment(conversation: ResolvedConversation): {
@@ -42,7 +50,7 @@ async function walk(
 ): Promise<void> {
 	const entries = await readdir(current, { withFileTypes: true });
 	for (const entry of entries) {
-		if (entry.name === ".git" || entry.name === "node_modules") continue;
+		if (entry.name === ".git" || entry.name === "node_modules" || entry.isSymbolicLink()) continue;
 		const absolutePath = path.join(current, entry.name);
 		const relativePath = toPosix(path.relative(root, absolutePath));
 		const shouldDescend = await visit(absolutePath, relativePath);
@@ -96,45 +104,77 @@ export class ConversationSandbox {
 		if (vm) await vm.close();
 	}
 
-	private resolveGuestPath(inputPath: string, allowShared = true): string {
+	private resolveGuestPath(inputPath: string): string {
 		const trimmed = inputPath.trim();
 		if (!trimmed) throw new Error("Path must not be empty");
 		const base = trimmed.startsWith("/") ? "/" : GONDOLIN_WORKSPACE;
-		const resolved = path.posix.resolve(base, trimmed);
-		if (resolved === GONDOLIN_WORKSPACE || resolved.startsWith(`${GONDOLIN_WORKSPACE}/`)) return resolved;
-		if (allowShared && (resolved === GONDOLIN_SHARED || resolved.startsWith(`${GONDOLIN_SHARED}/`))) return resolved;
-		throw new Error(
-			`Path must be inside ${GONDOLIN_WORKSPACE}${allowShared ? ` or ${GONDOLIN_SHARED}` : ""}: ${inputPath}`,
-		);
+		const guestPath = path.posix.resolve(base, trimmed);
+		if (!guestMountRoot(guestPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		return guestPath;
 	}
 
-	toAttachmentHostPath(inputPath: string): string {
-		const guestPath = this.resolveGuestPath(inputPath, false);
-		return this.guestToHostPath(guestPath);
-	}
-
-	resolveToolPath(inputPath: string, allowShared = true): string {
-		return this.resolveGuestPath(inputPath, allowShared);
-	}
-
-	guestToHostPath(inputPath: string, allowShared = true): string {
-		const guestPath = this.resolveGuestPath(inputPath, allowShared);
-		if (guestPath === GONDOLIN_WORKSPACE || guestPath.startsWith(`${GONDOLIN_WORKSPACE}/`)) {
-			const relativePath = path.posix.relative(GONDOLIN_WORKSPACE, guestPath);
-			return path.join(this.conversation.workspaceDir, ...relativePath.split("/").filter(Boolean));
+	async stageAttachment(inputPath: string): Promise<string> {
+		const sourcePath = this.guestToHostPath(inputPath);
+		const handle = await open(sourcePath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+		try {
+			const fileStats = await handle.stat();
+			if (!fileStats.isFile()) throw new Error(`Not a file: ${inputPath}`);
+			const stagingDir = path.join(this.conversation.gondolinDir, "outgoing");
+			await mkdir(stagingDir, { recursive: true });
+			const safeName = path.basename(sourcePath).replace(/[^a-zA-Z0-9._-]+/g, "_") || "attachment";
+			const stagedPath = path.join(stagingDir, `${Date.now()}-${randomUUID()}-${safeName}`);
+			await writeFile(stagedPath, await handle.readFile(), { flag: "wx" });
+			return stagedPath;
+		} finally {
+			await handle.close();
 		}
-		const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
-		return path.join(this.conversation.sharedDir, ...relativePath.split("/").filter(Boolean));
+	}
+
+	resolveToolPath(inputPath: string): string {
+		return this.resolveGuestPath(inputPath);
+	}
+
+	guestToHostPath(inputPath: string): string {
+		const guestPath = this.resolveGuestPath(inputPath);
+		const mountRoot = guestMountRoot(guestPath);
+		let hostRoot: string;
+		let hostPath: string;
+		if (mountRoot === GONDOLIN_WORKSPACE) {
+			const relativePath = path.posix.relative(GONDOLIN_WORKSPACE, guestPath);
+			hostRoot = this.conversation.workspaceDir;
+			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
+		} else if (mountRoot === GONDOLIN_SHARED) {
+			const relativePath = path.posix.relative(GONDOLIN_SHARED, guestPath);
+			hostRoot = this.conversation.sharedDir;
+			hostPath = path.join(hostRoot, ...relativePath.split("/").filter(Boolean));
+		} else {
+			throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		}
+		const resolvedRoot = realpathSync(hostRoot);
+		const resolvedHostPath = realpathSync(hostPath);
+		if (!isInside(resolvedRoot, resolvedHostPath)) throw new Error(`Path is outside mounted storage: ${inputPath}`);
+		return resolvedHostPath;
+	}
+
+	private assertMountedHostPath(hostPath: string): string {
+		const resolved = realpathSync(hostPath);
+		const workspaceRoot = realpathSync(this.conversation.workspaceDir);
+		if (isInside(workspaceRoot, resolved)) return resolved;
+		const sharedRoot = realpathSync(this.conversation.sharedDir);
+		if (isInside(sharedRoot, resolved)) return resolved;
+		throw new Error(`Path is outside mounted storage: ${hostPath}`);
 	}
 
 	hostToGuestPath(hostPath: string): string {
-		const resolved = path.resolve(hostPath);
-		if (isInside(this.conversation.workspaceDir, resolved)) {
-			const relativePath = toPosix(path.relative(this.conversation.workspaceDir, resolved));
+		const resolved = this.assertMountedHostPath(hostPath);
+		const workspaceRoot = realpathSync(this.conversation.workspaceDir);
+		if (isInside(workspaceRoot, resolved)) {
+			const relativePath = toPosix(path.relative(workspaceRoot, resolved));
 			return relativePath ? path.posix.join(GONDOLIN_WORKSPACE, relativePath) : GONDOLIN_WORKSPACE;
 		}
-		if (isInside(this.conversation.sharedDir, resolved)) {
-			const relativePath = toPosix(path.relative(this.conversation.sharedDir, resolved));
+		const sharedRoot = realpathSync(this.conversation.sharedDir);
+		if (isInside(sharedRoot, resolved)) {
+			const relativePath = toPosix(path.relative(sharedRoot, resolved));
 			return relativePath ? path.posix.join(GONDOLIN_SHARED, relativePath) : GONDOLIN_SHARED;
 		}
 		throw new Error(`Path is outside mounted storage: ${hostPath}`);
@@ -144,12 +184,12 @@ export class ConversationSandbox {
 		const vm = await this.start();
 		return {
 			readFile: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				return vm.fs.readFile(guestPath);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				return vm.fs.readFile(resolvedPath);
 			},
 			access: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				await vm.fs.access(guestPath);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				await vm.fs.access(resolvedPath);
 			},
 			detectImageMimeType: async (guestPath: string) => {
 				const ext = path.posix.extname(this.resolveGuestPath(guestPath)).toLowerCase();
@@ -166,12 +206,12 @@ export class ConversationSandbox {
 		const vm = await this.start();
 		return {
 			writeFile: async (guestPath: string, content: string) => {
-				this.resolveGuestPath(guestPath);
-				await vm.fs.writeFile(guestPath, content);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				await vm.fs.writeFile(resolvedPath, content);
 			},
 			mkdir: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				await vm.fs.mkdir(guestPath, { recursive: true });
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				await vm.fs.mkdir(resolvedPath, { recursive: true });
 			},
 		};
 	}
@@ -180,16 +220,16 @@ export class ConversationSandbox {
 		const vm = await this.start();
 		return {
 			readFile: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				return vm.fs.readFile(guestPath);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				return vm.fs.readFile(resolvedPath);
 			},
 			writeFile: async (guestPath: string, content: string) => {
-				this.resolveGuestPath(guestPath);
-				await vm.fs.writeFile(guestPath, content);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				await vm.fs.writeFile(resolvedPath, content);
 			},
 			access: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				await vm.fs.access(guestPath);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				await vm.fs.access(resolvedPath);
 			},
 		};
 	}
@@ -199,20 +239,20 @@ export class ConversationSandbox {
 		return {
 			exists: async (guestPath: string) => {
 				try {
-					this.resolveGuestPath(guestPath);
-					await vm.fs.access(guestPath);
+					const resolvedPath = this.resolveGuestPath(guestPath);
+					await vm.fs.access(resolvedPath);
 					return true;
 				} catch {
 					return false;
 				}
 			},
 			stat: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				return vm.fs.stat(guestPath);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				return vm.fs.stat(resolvedPath);
 			},
 			readdir: async (guestPath: string) => {
-				this.resolveGuestPath(guestPath);
-				return vm.fs.listDir(guestPath);
+				const resolvedPath = this.resolveGuestPath(guestPath);
+				return vm.fs.listDir(resolvedPath);
 			},
 		};
 	}
@@ -248,8 +288,8 @@ export class ConversationSandbox {
 
 	async createGrepOperations() {
 		return {
-			isDirectory: async (hostPath: string) => (await stat(hostPath)).isDirectory(),
-			readFile: async (hostPath: string) => readFile(hostPath, "utf8"),
+			isDirectory: async (hostPath: string) => (await stat(this.assertMountedHostPath(hostPath))).isDirectory(),
+			readFile: async (hostPath: string) => readFile(this.assertMountedHostPath(hostPath), "utf8"),
 		};
 	}
 

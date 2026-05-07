@@ -21,7 +21,8 @@ pi -e /path/to/pi-chat
 
 - [QEMU](https://www.qemu.org/) installed (`brew install qemu` on macOS)
 - Gondolin guest image (downloaded automatically on first connect)
-- A Discord bot token, Telegram bot token, or Slack app (bot + app-level tokens)
+- A Discord bot token or Telegram bot token
+- `tmux` for multi-channel worker orchestration
 
 ---
 
@@ -83,7 +84,14 @@ Required bot scopes/events are captured in `slack-app-manifest.yaml`; if you add
 | `/chat-disconnect` | Disconnect the current channel |
 | `/chat-status` | Show connection status, model, usage, context |
 | `/chat-list` | List configured channels |
+| `/chat-spawn-all` | Spawn every configured channel in detached tmux/pi sessions |
+| `/chat-spawn-all --restart` | Restart those tmux/pi sessions |
+| `/chat-workers` | Show managed tmux/pi worker status |
+| `/chat-open-all` | Open running workers in a tiled tmux dashboard |
+| `/chat-kill-all` | Kill all managed tmux/pi workers |
 | `/chat-new` | Start a new pi session, keeping the chat connection |
+
+Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. The `chat_workers` tool exposes the same status to an orchestrating pi agent.
 
 ---
 
