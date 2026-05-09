@@ -1,11 +1,11 @@
 # pi-chat
 
-A pi extension that bridges Discord, Telegram, and Slack channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
+A pi extension that bridges Discord, Telegram, and Slack channels to a sandboxed pi session. Each connected channel gets its own persistent workspace, shared storage, memory, and skills.
 
 ## Quick Start
 
 ```bash
-# Install
+# Install as pi extension (interactive mode)
 pi install /path/to/pi-chat
 # or
 pi -e /path/to/pi-chat
@@ -13,32 +13,107 @@ pi -e /path/to/pi-chat
 # Configure accounts and channels
 /chat-config
 
-# Connect
+# Option A — connect in this pi session
 /chat-connect
+
+# Option B — run as a background daemon (all channels at once)
+node daemon.ts
 ```
 
-### Requirements
+---
 
-- [QEMU](https://www.qemu.org/) installed (`brew install qemu` on macOS)
-- Gondolin guest image (downloaded automatically on first connect)
-- A Discord bot token or Telegram bot token
-- `tmux` for multi-channel worker orchestration
+## Modes
+
+### Interactive (pi extension)
+
+Load pi-chat as a pi extension and connect individual channels manually via slash commands. Good for development or single-channel use.
+
+### Daemon (background process)
+
+Run all configured channels in one headless process, no pi TUI required. This is the recommended mode for server deployments.
+
+```bash
+node daemon.ts
+```
+
+The daemon:
+- Connects every channel in `~/.pi/agent/chat/config.json` at startup
+- Restarts individual conversations on crash with exponential backoff (1s → 60s)
+- Handles `SIGINT`/`SIGTERM` for graceful shutdown
+- Maintains full conversation history and auto-compacts context when needed
+
+---
+
+## Server Setup
+
+1. **Configure locally** — run pi with `/chat-config` on your local machine to set up accounts and channels
+2. **Copy config to server**:
+   ```bash
+   rsync ~/.pi/agent/chat/config.json server:~/.pi/agent/chat/config.json
+   rsync ~/.pi/agent/auth.json server:~/.pi/agent/auth.json
+   ```
+3. **Start the daemon** on the server:
+   ```bash
+   node daemon.ts
+   ```
+
+**Keep it running:**
+
+```bash
+# Simple: run inside a persistent tmux session
+tmux new-session -d -s pi-chat 'node /path/to/pi-chat/daemon.ts'
+
+# macOS (survives reboots):
+# Create ~/Library/LaunchAgents/com.pi.chat.plist
+# See below
+```
+
+<details>
+<summary>launchd plist (macOS)</summary>
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pi.chat</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/path/to/pi-chat/daemon.ts</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/pi-chat.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/pi-chat.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.pi.chat.plist
+```
+
+</details>
 
 ---
 
 ## Features
 
 - **Discord server channels**, **Telegram DMs/groups**, and **Slack channels/DMs** (Socket Mode)
-- **Gondolin VM sandbox** per connection — tools run inside an isolated Alpine Linux micro-VM
-- **Persistent workspace** and **shared storage** across sessions
 - **Streamed preview** responses with edit-in-place
 - **Reply-to-trigger** — bot replies are attached to the triggering message
 - **Durable memory** — account-wide and channel-specific memory files
 - **Skills** — agent-created reusable tools, auto-discovered and injected into the prompt
 - **Encrypted secret exchange** — securely pass credentials via browser-based encryption
-- **Remote control** — stop, compact, new session, and status via chat commands
+- **Remote control** — stop, compact, and status via chat commands
 - **Chat history** tool for searching older messages
-- **File attachments** — send and receive files between chat and the VM
+- **File attachments** — send and receive files between chat and workspace
 
 ---
 
@@ -75,7 +150,7 @@ Required bot scopes/events are captured in `slack-app-manifest.yaml`; if you add
 
 ---
 
-## Commands
+## Commands (interactive mode only)
 
 | Command | Description |
 |---------|-------------|
@@ -91,8 +166,6 @@ Required bot scopes/events are captured in `slack-app-manifest.yaml`; if you add
 | `/chat-kill-all` | Kill all managed tmux/pi workers |
 | `/chat-new` | Start a new pi session, keeping the chat connection |
 
-Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. The `chat_workers` tool exposes the same status to an orchestrating pi agent.
-
 ---
 
 ## Remote Control
@@ -104,7 +177,6 @@ Users in the connected chat can send these commands (with or without mentioning 
 | `stop` | Abort the current turn |
 | `status` | Show model, usage, context stats |
 | `compact` | Trigger context compaction |
-| `new` | Start a new pi session |
 
 ---
 
@@ -117,35 +189,19 @@ Everything lives under `~/.pi/agent/chat/`:
 ├── config.json                          # Accounts, channels, secrets
 ├── cache/                               # Discovery cache
 └── accounts/<account>/
-    ├── shared/                          # Mounted as /shared in VM
+    ├── shared/                          # Account-wide storage
     │   ├── memory.md                    # Account-wide persistent memory
     │   └── skills/                      # Account-wide skills
     └── channels/<channel>/
         ├── channel.jsonl                # Chat log
         ├── .lock                        # Runtime lock
-        ├── workspace/                   # Mounted as /workspace in VM
-        │   ├── memory.md                # Channel-specific persistent memory
-        │   ├── skills/                  # Channel-specific skills
-        │   ├── incoming/                # Downloaded attachments
-        │   ├── .secrets/                # Encrypted secrets
-        │   └── SYSTEM.md                # Environment modification log
-        └── gondolin/                    # VM state
-            └── session.json
+        └── workspace/                   # Agent working directory
+            ├── memory.md                # Channel-specific persistent memory
+            ├── skills/                  # Channel-specific skills
+            ├── incoming/                # Downloaded attachments
+            ├── .secrets/                # Encrypted secrets
+            └── SYSTEM.md                # Environment modification log
 ```
-
----
-
-## VM Environment
-
-Each connection starts a Gondolin micro-VM with:
-
-- **Alpine Linux** with bash pre-installed
-- `/workspace` → channel workspace directory
-- `/shared` → account shared directory
-- Tools: `read`, `write`, `edit`, `bash`
-- All outbound HTTP/TLS open by default
-
-The agent sees `/workspace` as its working directory.
 
 ---
 
@@ -153,21 +209,21 @@ The agent sees `/workspace` as its working directory.
 
 Two persistent memory files, injected into the system prompt on every turn:
 
-| File | VM Path | Scope |
-|------|---------|-------|
-| Account memory | `/shared/memory.md` | Shared across all channels for this account |
-| Channel memory | `/workspace/memory.md` | Specific to this channel |
+| File | Path | Scope |
+|------|------|-------|
+| Account memory | `shared/memory.md` | Shared across all channels for this account |
+| Channel memory | `workspace/memory.md` | Specific to this channel |
 
-The agent is instructed to write durable facts and preferences to these files when asked to remember something. Account-wide goes to `/shared/memory.md`, channel-specific to `/workspace/memory.md`.
+The agent writes durable facts and preferences here when asked to remember something.
 
 ---
 
 ## Skills
 
-The agent can create reusable tools as skills, following the [Agent Skills standard](https://agentskills.io):
+The agent can create reusable tools as skills:
 
-- **Account-wide:** `/shared/skills/`
-- **Channel-specific:** `/workspace/skills/`
+- **Account-wide:** `shared/skills/`
+- **Channel-specific:** `workspace/skills/`
 
 A skill is either a single `.md` file (e.g. `skills/foo.md`) or a directory with `SKILL.md` plus supporting files (e.g. `skills/foo/SKILL.md`, `skills/foo/run.sh`).
 
@@ -180,13 +236,13 @@ description: Short description of what this skill does
 ---
 ```
 
-Skills are automatically discovered and listed in the system prompt. The agent reads the full skill file before using it.
+Skills are automatically discovered and listed in the system prompt each turn. The agent reads the full skill file before using it.
 
 ---
 
 ## Secrets
 
-### Config Secrets (Gondolin HTTP hooks)
+### Config Secrets
 
 Configure secrets at three levels via `/chat-config`:
 
@@ -194,20 +250,16 @@ Configure secrets at three levels via `/chat-config`:
 - **Per account** — shared across channels of that account
 - **Per channel** — specific to one channel
 
-Each secret has a value and allowed host patterns. Gondolin replaces placeholder env vars with real values only for outbound HTTP requests to allowed hosts. The agent never sees the real secret value.
-
 ### Runtime Secrets (encrypted exchange)
 
-For credentials the agent needs at runtime (API keys for skills, OAuth files, etc.):
+For credentials the agent needs at runtime:
 
 1. Agent calls the `chat_request_secret` tool
 2. A link to `pi.dev/secret` is sent to the chat with an embedded public key
 3. User clicks, pastes the secret, and gets an encrypted blob
 4. User pastes the blob back into chat
-5. pi-chat decrypts it (RSA-OAEP + AES-256-GCM) and stores it at `/workspace/.secrets/<name>`
+5. pi-chat decrypts it (RSA-OAEP + AES-256-GCM) and stores it at `workspace/.secrets/<name>`
 6. Agent is notified and can use the file
-
-The encrypted blob is useless without the ephemeral private key held in pi-chat's memory.
 
 ---
 
@@ -215,10 +267,10 @@ The encrypted blob is useless without the ephemeral private key held in pi-chat'
 
 | Tool | Description |
 |------|-------------|
-| `read` | Read files (routed through Gondolin VM) |
+| `read` | Read files from the workspace |
 | `write` | Create/overwrite files |
 | `edit` | Precise in-place edits |
-| `bash` | Execute commands (runs `/bin/bash` in the VM) |
+| `bash` | Execute shell commands |
 | `chat_history` | Search older messages from the chat log |
 | `chat_attach` | Queue files to send with the next reply |
 | `chat_request_secret` | Request a secret from the user via encrypted exchange |
