@@ -97,7 +97,18 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 
 	const ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	const runtime = await ConversationRuntime.connect(conversation, ownerId);
+	try {
+		await runWorkerWithRuntime(conversation, signal, runtime);
+	} finally {
+		await runtime.disconnect();
+	}
+}
 
+async function runWorkerWithRuntime(
+	conversation: ResolvedConversation,
+	signal: AbortSignal,
+	runtime: ConversationRuntime,
+): Promise<void> {
 	let liveConnection: LiveConnection | undefined;
 	let queuedAttachments: string[] = [];
 	let currentTriggerMessageId: string | undefined;
@@ -314,7 +325,6 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 
 	log(conversation, "shutting down...");
 	if (liveConnection) await liveConnection.disconnect().catch(() => undefined);
-	await runtime.disconnect();
 	session.dispose();
 	log(conversation, "stopped");
 }
