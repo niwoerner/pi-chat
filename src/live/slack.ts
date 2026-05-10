@@ -47,9 +47,18 @@ function slackErrorCode(error: unknown): string | undefined {
 const ALLOWED_SUBTYPES = new Set(["file_share", "me_message"]);
 
 function isRelevantMessage(event: SlackMessageEvent, account: SlackAccountConfig, channelId: string): boolean {
-	if (event.channel !== channelId) return false;
-	if (event.subtype !== undefined && !ALLOWED_SUBTYPES.has(event.subtype)) return false;
-	if (account.botUserId && event.user === account.botUserId) return false;
+	if (event.channel !== channelId) {
+		console.log(`[slack] skip: channel ${event.channel} !== ${channelId}`);
+		return false;
+	}
+	if (event.subtype !== undefined && !ALLOWED_SUBTYPES.has(event.subtype)) {
+		console.log(`[slack] skip: subtype=${event.subtype}`);
+		return false;
+	}
+	if (account.botUserId && event.user === account.botUserId) {
+		console.log(`[slack] skip: own message`);
+		return false;
+	}
 	return true;
 }
 
