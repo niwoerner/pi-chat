@@ -1,18 +1,18 @@
+import process from "node:process";
 import { ensureChatHome, listConfiguredConversations, loadChatConfig } from "./src/config.js";
-import { ConversationAgent } from "./src/conversation-agent.js";
 import type { ResolvedConversation } from "./src/core/config-types.js";
+import { runWorker } from "./src/worker.js";
 
 const RESTART_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 60_000];
 
-async function runWithRestart(conversation: ResolvedConversation): Promise<void> {
+async function runWithRestart(conversation: ResolvedConversation, signal: AbortSignal): Promise<void> {
 	let attempt = 0;
-	while (true) {
-		let agent: ConversationAgent | undefined;
+	while (!signal.aborted) {
 		try {
-			agent = await ConversationAgent.start(conversation);
-			await agent.waitUntilStopped();
+			await runWorker(conversation, signal);
 			return;
 		} catch (err) {
+			if (signal.aborted) return;
 			const delay = RESTART_DELAYS_MS[Math.min(attempt, RESTART_DELAYS_MS.length - 1)];
 			console.error(
 				`[${conversation.conversationName}] crashed (attempt ${attempt + 1}):`,
@@ -20,13 +20,9 @@ async function runWithRestart(conversation: ResolvedConversation): Promise<void>
 			);
 			console.log(`[${conversation.conversationName}] restarting in ${delay}ms...`);
 			attempt++;
-			await sleep(delay);
+			await new Promise((resolve) => setTimeout(resolve, delay));
 		}
 	}
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function main(): Promise<void> {
@@ -37,30 +33,28 @@ async function main(): Promise<void> {
 	if (conversations.length === 0) {
 		console.error(
 			"No configured channels found.\n" +
-				"Run pi with /chat-config to set up accounts and channels first,\n" +
+				"Edit ~/.pi/agent/chat/config.json to set up accounts and channels,\n" +
 				"then restart the daemon.",
 		);
 		process.exit(1);
 	}
 
-	console.log(`pi-chat daemon starting ${conversations.length} conversation(s):`);
+	console.log(`pi-chat daemon starting ${conversations.length} worker(s):`);
 	for (const conv of conversations) console.log(`  • ${conv.conversationName} (${conv.service})`);
 
-	const agents: ConversationAgent[] = [];
-
-	async function shutdown(signal: string): Promise<void> {
-		console.log(`\nReceived ${signal}, shutting down...`);
-		await Promise.all(agents.map((a) => a.stop().catch(() => undefined)));
-		process.exit(0);
+	const controller = new AbortController();
+	for (const sig of ["SIGTERM", "SIGINT"] as const) {
+		process.on(sig, () => {
+			console.log(`\nReceived ${sig}, shutting down...`);
+			controller.abort();
+		});
 	}
 
-	process.on("SIGINT", () => void shutdown("SIGINT"));
-	process.on("SIGTERM", () => void shutdown("SIGTERM"));
-
-	await Promise.all(conversations.map((conv) => runWithRestart(conv)));
+	await Promise.all(conversations.map((conv) => runWithRestart(conv, controller.signal)));
+	console.log("All workers stopped.");
 }
 
-main().catch((err) => {
-	console.error("Fatal:", err);
+main().catch((error) => {
+	console.error("Fatal:", error);
 	process.exit(1);
 });

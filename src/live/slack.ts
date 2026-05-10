@@ -88,7 +88,7 @@ async function eventToInput(
 	}
 	const mentionToken = account.botUserId ? `<@${account.botUserId}>` : undefined;
 	const mentionedBot =
-		(mentionToken ? text.includes(mentionToken) : false) || textMentionsBot(text, account.botUsername);
+		(mentionToken ? text.includes(mentionToken) : false) || textMentionsBot(text, account.botUsername, account.botUserId);
 	return {
 		messageId: event.ts,
 		userId: event.user || event.bot_id || "unknown",
@@ -232,6 +232,7 @@ export async function connectSlackLive(
 		preview.setReplyTo(ts);
 	};
 	await catchUp(client, conversation, account, handlers, setThread, resumeState?.cursor);
+	await handlers.onCaughtUp();
 	const onMessage = async ({ event, ack }: SlackMessageHandlerArgs) => {
 		try {
 			await ack();
@@ -249,7 +250,6 @@ export async function connectSlackLive(
 	};
 	socketClient.on("message", onMessage);
 	await socketClient.start();
-	await handlers.onCaughtUp();
 	return {
 		conversation,
 		disconnect: async () => {
