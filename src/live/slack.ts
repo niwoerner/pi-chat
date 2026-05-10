@@ -234,6 +234,7 @@ export async function connectSlackLive(
 	await catchUp(client, conversation, account, handlers, setThread, resumeState?.cursor);
 	await handlers.onCaughtUp();
 	const onMessage = async ({ event, ack }: SlackMessageHandlerArgs) => {
+		console.log(`[slack] message handler: type=${event?.type} subtype=${event?.subtype ?? "-"} channel=${event?.channel} user=${event?.user ?? event?.bot_id ?? "?"}`);
 		try {
 			await ack();
 		} catch (error) {
@@ -248,11 +249,10 @@ export async function connectSlackLive(
 			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
 		}
 	};
-	socketClient.on("slack_event", async (payload: unknown) => {
-		const p = payload as { body?: { event?: SlackMessageEvent }; ack?: () => Promise<void> };
-		const event = p.body?.event;
-		if (!event || event.type !== "message") return;
-		await onMessage({ event, ack: p.ack ?? (async () => {}) });
+	socketClient.on("message", onMessage);
+	socketClient.on("slack_event", ({ type, body }: { type?: string; body?: { event?: { type?: string } } }) => {
+		const inner = body?.event?.type;
+		console.log(`[slack] socket event: outer=${type ?? "?"} inner=${inner ?? "?"}`);
 	});
 	await socketClient.start();
 	return {
