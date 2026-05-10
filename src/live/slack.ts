@@ -248,10 +248,12 @@ export async function connectSlackLive(
 			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
 		}
 	};
-	socketClient.on("slack_event", async ({ body, ack }: { body: { event?: SlackMessageEvent }; ack: () => Promise<void> }) => {
-		const event = body?.event;
+	socketClient.on("slack_event", async (payload: unknown) => {
+		console.log("[slack-debug]", JSON.stringify(payload).slice(0, 600));
+		const p = payload as { body?: { event?: SlackMessageEvent }; ack?: () => Promise<void> };
+		const event = p.body?.event;
 		if (!event || event.type !== "message") return;
-		await onMessage({ event, ack });
+		await onMessage({ event, ack: p.ack ?? (async () => {}) });
 	});
 	await socketClient.start();
 	return {
