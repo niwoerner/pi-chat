@@ -199,7 +199,10 @@ async function runWorkerWithRuntime(
 	// --- Dispatch ---
 
 	async function dispatch(): Promise<void> {
-		if (inFlight || session.isStreaming) return;
+		if (inFlight || session.isStreaming) {
+			log(conversation, `dispatch skip: inFlight=${inFlight} streaming=${session.isStreaming}`);
+			return;
+		}
 		const next = runtime.beginNextJob();
 		if (!next) return;
 
@@ -247,6 +250,7 @@ async function runWorkerWithRuntime(
 			conversation,
 			{
 				onMessage: async (input, checkpoint) => {
+					log(conversation, `message from ${input.userId}: "${input.text.slice(0, 60)}" mention=${input.mentionedBot} bot=${input.isBot}`);
 					if (!liveConnection) return;
 
 					// Secret exchange
@@ -288,7 +292,8 @@ async function runWorkerWithRuntime(
 						}
 					}
 
-					await runtime.ingestInbound(input, checkpoint);
+					const { jobQueued } = await runtime.ingestInbound(input, checkpoint);
+					log(conversation, `ingest: jobQueued=${jobQueued} armed=${runtime.isArmed()}`);
 					await dispatch();
 				},
 				onCaughtUp: async () => {
