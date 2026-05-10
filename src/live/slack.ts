@@ -237,8 +237,12 @@ export async function connectSlackLive(
 		},
 	});
 	const setThread = (ts: string | undefined) => {
-		currentThreadTs = ts;
-		preview.setReplyTo(ts);
+		// Don't thread in DM channels — Slack shows thread replies in the main
+		// DM view too, causing the message to appear twice.
+		if (!conversation.channel.dm) {
+			currentThreadTs = ts;
+			preview.setReplyTo(ts);
+		}
 	};
 	await catchUp(client, conversation, account, handlers, setThread, resumeState?.cursor);
 	await handlers.onCaughtUp();
