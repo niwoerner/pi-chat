@@ -249,6 +249,10 @@ export async function connectSlackLive(
 		}
 	};
 	socketClient.on("message", onMessage);
+	// DEBUG: log all socket events to diagnose missing live messages
+	socketClient.on("slack_event", ({ event }: { event?: { type?: string; channel?: string } }) => {
+		console.log(`[slack-debug] slack_event: type=${event?.type} channel=${event?.channel}`);
+	});
 	await socketClient.start();
 	return {
 		conversation,
