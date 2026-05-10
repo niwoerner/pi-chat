@@ -7,7 +7,6 @@ import type { ResolvedConversation, SlackAccountConfig } from "../core/config-ty
 import type { InboundMessageInput } from "../core/runtime-types.js";
 import { chunkText } from "../render/chunking.js";
 import { formatMarkdownForService, maxMessageLength } from "../render/format.js";
-import { StreamingPreview } from "../render/streaming.js";
 import { fetchBinary, readLocalAttachment, storeDownloadedAttachment, textMentionsBot } from "./common.js";
 import type { LiveConnection, LiveConnectionHandlers, ResumeState } from "./types.js";
 
@@ -125,17 +124,6 @@ async function catchUp(
 	}
 }
 
-function createEditThrottle(): (id: string) => Promise<void> {
-	const nextAllowedAt = new Map<string, number>();
-	const MIN_INTERVAL_MS = 400;
-	return async (id: string) => {
-		const now = Date.now();
-		const readyAt = nextAllowedAt.get(id) ?? 0;
-		if (readyAt > now) await new Promise((resolve) => setTimeout(resolve, readyAt - now));
-		nextAllowedAt.set(id, Math.max(Date.now(), readyAt) + MIN_INTERVAL_MS);
-	};
-}
-
 async function sendSlackText(client: WebClient, channel: string, text: string, threadTs?: string): Promise<string> {
 	const rendered = formatMarkdownForService("slack", text);
 	const chunks = chunkText(rendered.text, maxMessageLength("slack"));
@@ -177,6 +165,53 @@ async function sendSlackAttachments(
 	return firstTs || "";
 }
 
+// --- Shared socket per appToken ---
+// Slack delivers events to only one WebSocket connection per app token.
+// All channels on the same account must share one SocketModeClient.
+
+interface SharedSocketEntry {
+	client: SocketModeClient;
+	refCount: number;
+	disconnectHandlers: Set<() => Promise<void>>;
+}
+
+const sharedSlackSockets = new Map<string, SharedSocketEntry>();
+
+async function acquireSocket(appToken: string): Promise<SocketModeClient> {
+	const existing = sharedSlackSockets.get(appToken);
+	if (existing) {
+		existing.refCount++;
+		console.log(`[slack] reusing shared socket (refCount=${existing.refCount})`);
+		return existing.client;
+	}
+	const client = new SocketModeClient({ appToken });
+	const entry: SharedSocketEntry = { client, refCount: 1, disconnectHandlers: new Set() };
+	// Set before await so concurrent acquireSocket calls see the entry immediately.
+	sharedSlackSockets.set(appToken, entry);
+	client.on("disconnected", async () => {
+		console.log(`[slack] shared socket disconnected`);
+		sharedSlackSockets.delete(appToken);
+		for (const handler of [...entry.disconnectHandlers]) {
+			await handler().catch(() => undefined);
+		}
+	});
+	console.log(`[slack] starting new shared socket`);
+	await client.start();
+	return client;
+}
+
+function releaseSocket(appToken: string, disconnectHandler: (() => Promise<void>) | undefined): void {
+	const entry = sharedSlackSockets.get(appToken);
+	if (!entry) return;
+	if (disconnectHandler) entry.disconnectHandlers.delete(disconnectHandler);
+	entry.refCount--;
+	console.log(`[slack] release socket (refCount=${entry.refCount})`);
+	if (entry.refCount <= 0) {
+		sharedSlackSockets.delete(appToken);
+		entry.client.disconnect().catch(() => undefined);
+	}
+}
+
 export async function connectSlackLive(
 	conversation: ResolvedConversation,
 	handlers: LiveConnectionHandlers,
@@ -184,55 +219,32 @@ export async function connectSlackLive(
 ): Promise<LiveConnection> {
 	const account = conversation.account as SlackAccountConfig;
 	const client = new WebClient(account.botToken);
-	const socketClient = new SocketModeClient({ appToken: account.appToken });
 	const channelId = conversation.channel.id;
 	let currentThreadTs: string | undefined;
-	const throttleEdit = createEditThrottle();
-	const preview = new StreamingPreview(conversation.service, {
-		create: async (text, _parseMode, replyToMessageId) => {
-			const response = (await client.chat.postMessage({
-				channel: channelId,
-				text,
-				thread_ts: replyToMessageId,
-				unfurl_links: false,
-				unfurl_media: false,
-			})) as { ts?: string };
-			if (!response.ts) throw new Error("Slack chat.postMessage returned no ts");
-			return response.ts;
-		},
-		edit: async (id, text) => {
-			await throttleEdit(id);
-			try {
-				await client.chat.update({ channel: channelId, ts: id, text });
-			} catch (error) {
-				const code = slackErrorCode(error);
-				if (code === "msg_too_long") {
-					const limit = maxMessageLength("slack");
-					try {
-						await client.chat.update({ channel: channelId, ts: id, text: text.slice(0, limit) });
-					} catch (inner) {
-						if (slackErrorCode(inner) !== "message_not_found") throw inner;
-					}
-					return;
-				}
-				if (code === "message_not_found") return;
-				throw error;
-			}
-		},
-		delete: async (id) => {
-			try {
-				await client.chat.delete({ channel: channelId, ts: id });
-			} catch (error) {
-				if (slackErrorCode(error) !== "message_not_found") throw error;
-			}
-		},
-	});
+
 	const setThread = (ts: string | undefined) => {
-		currentThreadTs = ts;
-		preview.setReplyTo(ts);
+		// Don't thread in DM channels — Slack shows thread replies in the main
+		// DM view too, causing the message to appear twice.
+		if (!conversation.channel.dm) {
+			currentThreadTs = ts;
+		}
 	};
+
 	await catchUp(client, conversation, account, handlers, setThread, resumeState?.cursor);
 	await handlers.onCaughtUp();
+
+	const socketClient = await acquireSocket(account.appToken);
+
+	const disconnectHandler = handlers.onDisconnect
+		? async () => {
+				await handlers.onDisconnect!();
+			}
+		: undefined;
+	if (disconnectHandler) {
+		const entry = sharedSlackSockets.get(account.appToken);
+		if (entry) entry.disconnectHandlers.add(disconnectHandler);
+	}
+
 	const onMessage = async ({ event, ack }: SlackMessageHandlerArgs) => {
 		try {
 			await ack();
@@ -242,19 +254,22 @@ export async function connectSlackLive(
 		try {
 			const input = await eventToInput(conversation, account, event);
 			if (!input) return;
+			console.log(`[slack:${channelId}] message from ${input.userId}: "${input.text.slice(0, 60)}"`);
 			setThread(event.thread_ts || event.ts);
 			await handlers.onMessage(input, { cursor: event.ts, messageId: event.ts });
 		} catch (error) {
+			console.log(`[slack:${channelId}] onMessage error: ${error}`);
 			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
 		}
 	};
+
 	socketClient.on("message", onMessage);
-	await socketClient.start();
+
 	return {
 		conversation,
 		disconnect: async () => {
 			socketClient.off("message", onMessage);
-			await socketClient.disconnect().catch(() => undefined);
+			releaseSocket(account.appToken, disconnectHandler);
 		},
 		sendImmediate: async (text, replyToMessageId) =>
 			sendSlackText(client, channelId, text, replyToMessageId ?? currentThreadTs),
@@ -265,8 +280,8 @@ export async function connectSlackLive(
 		},
 		startTyping: async () => {},
 		stopTyping: async () => {},
-		syncPreview: async (markdown, done = false) => preview.update(markdown, done),
-		clearPreview: async () => preview.clear(),
+		syncPreview: async () => [],
+		clearPreview: async () => {},
 		setReplyTo: (messageId) => setThread(messageId),
 	};
 }

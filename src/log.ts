@@ -89,7 +89,8 @@ export async function appendConversationRecord(
 }
 
 function extractOwnerPid(owner: string): number | undefined {
-	const match = owner.match(/^pi-chat-(\d+)-/);
+	// Matches: pi-chat-<PID>-, pi-chat-daemon-<PID>-, daemon-<PID>-
+	const match = owner.match(/^(?:pi-chat-daemon-|pi-chat-|daemon-)(\d+)-/);
 	if (!match) return undefined;
 	const pid = Number(match[1]);
 	return Number.isFinite(pid) ? pid : undefined;
@@ -123,7 +124,7 @@ export async function acquireConversationLock(conversation: ResolvedConversation
 	}
 	const existingOwner = (await readFile(conversation.lockPath, "utf8")).trim();
 	const existingPid = extractOwnerPid(existingOwner);
-	if (existingPid !== undefined && !isPidAlive(existingPid)) {
+	if (existingPid === undefined || !isPidAlive(existingPid)) {
 		await unlink(conversation.lockPath).catch(() => undefined);
 		const handle = await open(conversation.lockPath, "wx");
 		try {

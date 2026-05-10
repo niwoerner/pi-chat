@@ -95,9 +95,20 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 	await mkdir(conversation.sharedDir, { recursive: true });
 	await mkdir(conversation.filesDir, { recursive: true });
 
-	const ownerId = `daemon-${process.pid}-${randomUUID()}`;
+	const ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	const runtime = await ConversationRuntime.connect(conversation, ownerId);
+	try {
+		await runWorkerWithRuntime(conversation, signal, runtime);
+	} finally {
+		await runtime.disconnect();
+	}
+}
 
+async function runWorkerWithRuntime(
+	conversation: ResolvedConversation,
+	signal: AbortSignal,
+	runtime: ConversationRuntime,
+): Promise<void> {
 	let liveConnection: LiveConnection | undefined;
 	let queuedAttachments: string[] = [];
 	let currentTriggerMessageId: string | undefined;
@@ -188,7 +199,10 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 	// --- Dispatch ---
 
 	async function dispatch(): Promise<void> {
-		if (inFlight || session.isStreaming) return;
+		if (inFlight || session.isStreaming) {
+			log(conversation, `dispatch skip: inFlight=${inFlight} streaming=${session.isStreaming}`);
+			return;
+		}
 		const next = runtime.beginNextJob();
 		if (!next) return;
 
@@ -236,7 +250,7 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 			conversation,
 			{
 				onMessage: async (input, checkpoint) => {
-					if (!liveConnection) return;
+					log(conversation, `message from ${input.userId}: "${input.text.slice(0, 60)}" mention=${input.mentionedBot} bot=${input.isBot}`);
 
 					// Secret exchange
 					const secretResult = tryDecryptSecret(input.text);
@@ -244,7 +258,7 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 						const secretPath = join(conversation.workspaceDir, ".secrets", secretResult.name);
 						await mkdir(join(conversation.workspaceDir, ".secrets"), { recursive: true });
 						await writeFile(secretPath, secretResult.decrypted);
-						await liveConnection.sendImmediate(`✅ Secret stored at ${secretPath}`);
+						await liveConnection?.sendImmediate(`✅ Secret stored at ${secretPath}`);
 						if (checkpoint) await runtime.noteCheckpoint(checkpoint);
 						await runtime.ingestInbound(
 							{ ...input, text: `[secret stored: ${secretResult.name}]`, mentionedBot: true },
@@ -259,25 +273,26 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 						const control = runtime.parseControlCommand(input);
 						if (control === "stop") {
 							await session.abort();
-							await liveConnection.sendImmediate("Aborted.");
+							await liveConnection?.sendImmediate("Aborted.");
 							return;
 						}
 						if (control === "compact") {
-							await liveConnection.sendImmediate("Compacting...");
+							await liveConnection?.sendImmediate("Compacting...");
 							await session.compact();
-							await liveConnection.sendImmediate("Done.");
+							await liveConnection?.sendImmediate("Done.");
 							return;
 						}
 						if (control === "status") {
 							const s = runtime.getStatus();
-							await liveConnection.sendImmediate(
+							await liveConnection?.sendImmediate(
 								`Queue: ${s.queueLength}${s.hasActiveJob ? " (active)" : ""} | Records: ${s.recordCount} | Session: ${session.sessionId}`,
 							);
 							return;
 						}
 					}
 
-					await runtime.ingestInbound(input, checkpoint);
+					const { jobQueued } = await runtime.ingestInbound(input, checkpoint);
+					log(conversation, `ingest: jobQueued=${jobQueued} armed=${runtime.isArmed()}`);
 					await dispatch();
 				},
 				onCaughtUp: async () => {
@@ -314,7 +329,6 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 
 	log(conversation, "shutting down...");
 	if (liveConnection) await liveConnection.disconnect().catch(() => undefined);
-	await runtime.disconnect();
 	session.dispose();
 	log(conversation, "stopped");
 }
