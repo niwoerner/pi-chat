@@ -33,7 +33,7 @@
   settings:
     event_subscriptions:
       bot_events:
-      - message.channels
+        - message.channels
         - message.groups
         - message.im
         - message.mpim

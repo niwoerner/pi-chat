@@ -251,7 +251,6 @@ async function runWorkerWithRuntime(
 			{
 				onMessage: async (input, checkpoint) => {
 					log(conversation, `message from ${input.userId}: "${input.text.slice(0, 60)}" mention=${input.mentionedBot} bot=${input.isBot}`);
-					if (!liveConnection) return;
 
 					// Secret exchange
 					const secretResult = tryDecryptSecret(input.text);
@@ -259,7 +258,7 @@ async function runWorkerWithRuntime(
 						const secretPath = join(conversation.workspaceDir, ".secrets", secretResult.name);
 						await mkdir(join(conversation.workspaceDir, ".secrets"), { recursive: true });
 						await writeFile(secretPath, secretResult.decrypted);
-						await liveConnection.sendImmediate(`✅ Secret stored at ${secretPath}`);
+						await liveConnection?.sendImmediate(`✅ Secret stored at ${secretPath}`);
 						if (checkpoint) await runtime.noteCheckpoint(checkpoint);
 						await runtime.ingestInbound(
 							{ ...input, text: `[secret stored: ${secretResult.name}]`, mentionedBot: true },
@@ -274,18 +273,18 @@ async function runWorkerWithRuntime(
 						const control = runtime.parseControlCommand(input);
 						if (control === "stop") {
 							await session.abort();
-							await liveConnection.sendImmediate("Aborted.");
+							await liveConnection?.sendImmediate("Aborted.");
 							return;
 						}
 						if (control === "compact") {
-							await liveConnection.sendImmediate("Compacting...");
+							await liveConnection?.sendImmediate("Compacting...");
 							await session.compact();
-							await liveConnection.sendImmediate("Done.");
+							await liveConnection?.sendImmediate("Done.");
 							return;
 						}
 						if (control === "status") {
 							const s = runtime.getStatus();
-							await liveConnection.sendImmediate(
+							await liveConnection?.sendImmediate(
 								`Queue: ${s.queueLength}${s.hasActiveJob ? " (active)" : ""} | Records: ${s.recordCount} | Session: ${session.sessionId}`,
 							);
 							return;
