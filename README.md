@@ -14,16 +14,72 @@ npm start
 npx tsx daemon.ts
 ```
 
-The daemon starts one worker per configured channel concurrently. Each worker connects to its chat service, catches up on missed messages, then listens for new ones.
+The daemon starts one worker per configured channel concurrently. Each worker connects to its chat service, catches up on missed messages, then listens for new ones. Workers restart automatically on crash with exponential backoff (1s → 60s).
 
 ---
 
 ## Requirements
 
 - Node.js 20+
-- `tsx` (installed via npx, or `npm install -g tsx`)
+- `tsx` (`npm install` includes it as a devDependency)
 - A Slack, Discord, or Telegram bot token
 - pi credentials configured (`~/.pi/agent/auth.json`) — the daemon uses the same model/auth as your pi install
+
+---
+
+## Server Setup
+
+1. **Configure locally** — edit `~/.pi/agent/chat/config.json` (or use `/chat-config` inside pi) on your local machine
+2. **Copy config to server**:
+   ```bash
+   rsync ~/.pi/agent/chat/config.json server:~/.pi/agent/chat/config.json
+   rsync ~/.pi/agent/auth.json server:~/.pi/agent/auth.json
+   ```
+3. **Start the daemon** on the server:
+   ```bash
+   npm start
+   ```
+
+**Keep it running:**
+
+```bash
+# Simple: run inside a persistent tmux session
+tmux new-session -d -s pi-chat 'npm --prefix /path/to/pi-chat start'
+```
+
+<details>
+<summary>launchd plist (macOS)</summary>
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.pi.chat</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/path/to/pi-chat/node_modules/.bin/tsx</string>
+        <string>/path/to/pi-chat/daemon.ts</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/pi-chat.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/pi-chat.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.pi.chat.plist
+```
+
+</details>
 
 ---
 
@@ -149,7 +205,7 @@ Any allowed user in a connected chat can send these commands (with or without @m
             └── .secrets/      # Runtime secrets
 ```
 
-The pi session for each channel is stored under `~/.pi/agent/sessions/` using the workspace dir as the cwd key. Sessions persist across daemon restarts — the agent remembers conversation context.
+The pi session for each channel is stored under `~/.pi/agent/sessions/` keyed by workspace dir. Sessions persist across daemon restarts — the agent remembers conversation context.
 
 ---
 
@@ -168,7 +224,7 @@ The agent writes durable facts and preferences here when asked to remember somet
 
 ## Skills
 
-Skills are markdown files with YAML frontmatter discovered at startup and listed in the system prompt:
+Skills are markdown files with YAML frontmatter, discovered at runtime and listed in the system prompt:
 
 ```yaml
 ---

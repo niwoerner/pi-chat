@@ -20,7 +20,7 @@
 		]
 	},
 	"scripts": {
-		"start": "npx tsx daemon.ts",
+		"start": "tsx daemon.ts",
 		"check": "biome check . && tsc --noEmit",
 		"format": "biome check --write ."
 	},
@@ -40,6 +40,7 @@
 		"@biomejs/biome": "^2.3.5",
 		"@types/node": "^24.5.2",
 		"@types/ws": "^8.18.1",
+		"tsx": "^4.19.4",
 		"typescript": "^5.9.2"
 	}
 }

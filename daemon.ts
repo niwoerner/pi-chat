@@ -1,6 +1,29 @@
 import process from "node:process";
 import { ensureChatHome, listConfiguredConversations, loadChatConfig } from "./src/config.js";
+import type { ResolvedConversation } from "./src/core/config-types.js";
 import { runWorker } from "./src/worker.js";
+
+const RESTART_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 60_000];
+
+async function runWithRestart(conversation: ResolvedConversation, signal: AbortSignal): Promise<void> {
+	let attempt = 0;
+	while (!signal.aborted) {
+		try {
+			await runWorker(conversation, signal);
+			return;
+		} catch (err) {
+			if (signal.aborted) return;
+			const delay = RESTART_DELAYS_MS[Math.min(attempt, RESTART_DELAYS_MS.length - 1)];
+			console.error(
+				`[${conversation.conversationName}] crashed (attempt ${attempt + 1}):`,
+				err instanceof Error ? err.message : String(err),
+			);
+			console.log(`[${conversation.conversationName}] restarting in ${delay}ms...`);
+			attempt++;
+			await new Promise((resolve) => setTimeout(resolve, delay));
+		}
+	}
+}
 
 async function main(): Promise<void> {
 	await ensureChatHome();
@@ -8,12 +31,16 @@ async function main(): Promise<void> {
 	const conversations = listConfiguredConversations(config);
 
 	if (conversations.length === 0) {
-		console.error("No channels configured. Edit ~/.pi/agent/chat/config.json");
+		console.error(
+			"No configured channels found.\n" +
+				"Edit ~/.pi/agent/chat/config.json to set up accounts and channels,\n" +
+				"then restart the daemon.",
+		);
 		process.exit(1);
 	}
 
 	console.log(`pi-chat daemon starting ${conversations.length} worker(s):`);
-	for (const conv of conversations) console.log(`  ${conv.conversationName}`);
+	for (const conv of conversations) console.log(`  • ${conv.conversationName} (${conv.service})`);
 
 	const controller = new AbortController();
 	for (const sig of ["SIGTERM", "SIGINT"] as const) {
@@ -23,7 +50,7 @@ async function main(): Promise<void> {
 		});
 	}
 
-	await Promise.all(conversations.map((conv) => runWorker(conv, controller.signal)));
+	await Promise.all(conversations.map((conv) => runWithRestart(conv, controller.signal)));
 	console.log("All workers stopped.");
 }
 
