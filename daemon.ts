@@ -1,7 +1,32 @@
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import process from "node:process";
 import { ensureChatHome, listConfiguredConversations, loadChatConfig } from "./src/config.js";
 import type { ResolvedConversation } from "./src/core/config-types.js";
 import { runWorker } from "./src/worker.js";
+
+async function loadDotenv(dir: string): Promise<void> {
+	let raw: string;
+	try {
+		raw = await readFile(join(dir, ".env"), "utf8");
+	} catch {
+		return;
+	}
+	for (const line of raw.split("\n")) {
+		const trimmed = line.trim();
+		if (!trimmed || trimmed.startsWith("#")) continue;
+		const eq = trimmed.indexOf("=");
+		if (eq === -1) continue;
+		const key = trimmed.slice(0, eq).trim().replace(/^export\s+/, "");
+		if (!key || key in process.env) continue;
+		let value = trimmed.slice(eq + 1).trim();
+		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+			value = value.slice(1, -1);
+		}
+		process.env[key] = value;
+	}
+	console.log(`Loaded .env from ${dir}`);
+}
 
 const RESTART_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 60_000];
 
@@ -26,6 +51,7 @@ async function runWithRestart(conversation: ResolvedConversation, signal: AbortS
 }
 
 async function main(): Promise<void> {
+	await loadDotenv(process.cwd());
 	await ensureChatHome();
 	const config = await loadChatConfig();
 	const conversations = listConfiguredConversations(config);
