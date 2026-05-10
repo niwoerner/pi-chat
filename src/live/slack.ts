@@ -251,10 +251,13 @@ export async function connectSlackLive(
 		}
 		try {
 			const input = await eventToInput(conversation, account, event);
+			console.log(`[slack] eventToInput: ${input ? `ok text="${input.text.slice(0, 40)}"` : "null"}`);
 			if (!input) return;
 			setThread(event.thread_ts || event.ts);
 			await handlers.onMessage(input, { cursor: event.ts, messageId: event.ts });
+			console.log(`[slack] handlers.onMessage done`);
 		} catch (error) {
+			console.log(`[slack] onMessage error: ${error}`);
 			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
 		}
 	};
