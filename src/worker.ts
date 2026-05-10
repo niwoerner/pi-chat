@@ -211,6 +211,7 @@ async function runWorkerWithRuntime(
 		queuedAttachments = [];
 		currentText = "";
 		liveConnection?.setReplyTo(currentTriggerMessageId);
+		await liveConnection?.startTyping();
 		log(conversation, `dispatching job ${next.job.jobId}`);
 
 		try {
@@ -235,6 +236,7 @@ async function runWorkerWithRuntime(
 				// ignore secondary send failure
 			}
 		} finally {
+			await liveConnection?.stopTyping();
 			inFlight = false;
 			currentText = "";
 		}
