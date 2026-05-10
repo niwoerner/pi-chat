@@ -124,7 +124,7 @@ export async function acquireConversationLock(conversation: ResolvedConversation
 	}
 	const existingOwner = (await readFile(conversation.lockPath, "utf8")).trim();
 	const existingPid = extractOwnerPid(existingOwner);
-	if (existingPid !== undefined && !isPidAlive(existingPid)) {
+	if (existingPid === undefined || !isPidAlive(existingPid)) {
 		await unlink(conversation.lockPath).catch(() => undefined);
 		const handle = await open(conversation.lockPath, "wx");
 		try {
