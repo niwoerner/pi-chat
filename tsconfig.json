@@ -10,5 +10,6 @@
 		"esModuleInterop": true,
 		"types": ["node"]
 	},
-	"include": ["index.ts", "types.ts", "src/**/*.ts", "types/**/*.d.ts"]
+	"include": ["daemon.ts", "types.ts", "src/**/*.ts", "types/**/*.d.ts"],
+	"exclude": ["src/gondolin.ts", "src/tui", "src/render", "src/services"]
 }

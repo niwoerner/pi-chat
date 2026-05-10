@@ -2,7 +2,7 @@
 	"name": "pi-chat",
 	"version": "0.1.0",
 	"private": false,
-	"description": "Multi-service chat bridge extension for pi",
+	"description": "Multi-service chat bridge daemon for pi (Slack, Discord, Telegram)",
 	"type": "module",
 	"keywords": [
 		"pi-package",
@@ -11,8 +11,7 @@
 		"bridge",
 		"telegram",
 		"discord",
-		"slack",
-		"extension"
+		"slack"
 	],
 	"license": "MIT",
 	"pi": {
@@ -20,17 +19,17 @@
 			"./index.ts"
 		]
 	},
+	"scripts": {
+		"start": "npx tsx daemon.ts",
+		"check": "biome check . && tsc --noEmit",
+		"format": "biome check --write ."
+	},
 	"dependencies": {
-		"@earendil-works/gondolin": "^0.7.0",
 		"@slack/socket-mode": "^2.0.7",
 		"@slack/web-api": "^7.15.2",
 		"discord.js": "^14.26.3",
 		"remend": "^1.3.0",
 		"ws": "^8.18.3"
-	},
-	"scripts": {
-		"check": "biome check . && tsc --noEmit",
-		"format": "biome check --write ."
 	},
 	"peerDependencies": {
 		"@mariozechner/pi-coding-agent": "*",

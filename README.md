@@ -1,237 +1,202 @@
 # pi-chat
 
-A pi extension that bridges Discord, Telegram, and Slack channels to a sandboxed pi session. Each connected channel gets its own [Gondolin](https://github.com/earendil-works/gondolin) micro-VM with persistent workspace, shared storage, memory, and skills.
+A standalone daemon that bridges Slack, Discord, and Telegram channels to a pi agent session. Each configured channel gets its own persistent pi session with dedicated workspace, shared storage, memory, and skills.
 
 ## Quick Start
 
 ```bash
-# Install
-pi install /path/to/pi-chat
-# or
-pi -e /path/to/pi-chat
-
 # Configure accounts and channels
-/chat-config
+# Edit ~/.pi/agent/chat/config.json (see Config below)
 
-# Connect
-/chat-connect
+# Run the daemon
+npm start
+# or directly:
+npx tsx daemon.ts
 ```
 
-### Requirements
-
-- [QEMU](https://www.qemu.org/) installed (`brew install qemu` on macOS)
-- Gondolin guest image (downloaded automatically on first connect)
-- A Discord bot token or Telegram bot token
-- `tmux` for multi-channel worker orchestration
+The daemon starts one worker per configured channel concurrently. Each worker connects to its chat service, catches up on missed messages, then listens for new ones.
 
 ---
 
-## Features
+## Requirements
 
-- **Discord server channels**, **Telegram DMs/groups**, and **Slack channels/DMs** (Socket Mode)
-- **Gondolin VM sandbox** per connection — tools run inside an isolated Alpine Linux micro-VM
-- **Persistent workspace** and **shared storage** across sessions
-- **Streamed preview** responses with edit-in-place
-- **Reply-to-trigger** — bot replies are attached to the triggering message
-- **Durable memory** — account-wide and channel-specific memory files
-- **Skills** — agent-created reusable tools, auto-discovered and injected into the prompt
-- **Encrypted secret exchange** — securely pass credentials via browser-based encryption
-- **Remote control** — stop, compact, new session, and status via chat commands
-- **Chat history** tool for searching older messages
-- **File attachments** — send and receive files between chat and the VM
+- Node.js 20+
+- `tsx` (installed via npx, or `npm install -g tsx`)
+- A Slack, Discord, or Telegram bot token
+- pi credentials configured (`~/.pi/agent/auth.json`) — the daemon uses the same model/auth as your pi install
+
+---
+
+## Config
+
+Config lives at `~/.pi/agent/chat/config.json`:
+
+```json
+{
+  "botName": "pi",
+  "accounts": {
+    "my-slack": {
+      "service": "slack",
+      "name": "My Workspace",
+      "botToken": "xoxb-...",
+      "appToken": "xapp-...",
+      "teamId": "T...",
+      "teamName": "My Team",
+      "botUserId": "U...",
+      "botUsername": "pi",
+      "access": {
+        "trigger": "mention",
+        "ignoreBots": true,
+        "allowedUserIds": ["U123456"]
+      },
+      "channels": {
+        "general": {
+          "id": "C...",
+          "name": "general"
+        },
+        "bot-dm": {
+          "id": "C...",
+          "name": "bot-dm",
+          "dm": true,
+          "access": { "trigger": "message" }
+        }
+      }
+    },
+    "my-discord": {
+      "service": "discord",
+      "botToken": "...",
+      "applicationId": "...",
+      "serverId": "...",
+      "serverName": "My Server",
+      "botUserId": "...",
+      "botUsername": "pi",
+      "channels": {
+        "general": { "id": "...", "name": "general" }
+      }
+    }
+  }
+}
+```
+
+### Access policy
+
+| Field | Default | Description |
+|---|---|---|
+| `trigger` | `"mention"` | `"mention"` — only @mentions trigger the bot; `"message"` — every message does |
+| `ignoreBots` | `true` | Ignore messages from other bots |
+| `allowedUserIds` | (all) | Whitelist of user IDs that can trigger the bot |
+| `allowedRoleIds` | (all) | Whitelist of role IDs (Discord only) |
+
+Account-level access is merged with channel-level access; channel settings take precedence.
 
 ---
 
 ## Setup
 
-### Discord
-
-1. Create a bot at [Discord Developer Portal](https://discord.com/developers/applications)
-2. Enable **Message Content Intent** under Bot settings
-3. Run `/chat-config` → Create account → Discord
-4. Enter your bot token
-5. Invite the bot to a server (the setup flow provides the invite URL)
-6. Select a server and configure channels
-
-### Telegram
-
-1. Create a bot via [@BotFather](https://t.me/BotFather)
-2. Run `/chat-config` → Create account → Telegram
-3. Enter your bot token
-4. Add DMs or groups through the guided setup
-
 ### Slack
 
 1. Create a Slack app at https://api.slack.com/apps using **Create New App → From an app manifest**.
-2. Paste the included [`slack-app-manifest.yaml`](./slack-app-manifest.yaml). Adjust the app name/display name if desired.
-3. Install the app to your workspace and copy the **Bot User OAuth Token** (`xoxb-...`).
-4. In **Basic Information → App-Level Tokens**, generate an app-level token with `connections:write`; copy the token (`xapp-...`).
-5. Run `/chat-config` → Create account → Slack. Paste the `xoxb-...` bot token and `xapp-...` app token.
-6. Invite the bot to any Slack channels you want to use, then select Slack channels/DMs to configure.
+2. Paste the included [`slack-app-manifest.yaml`](./slack-app-manifest.yaml).
+3. Install the app to your workspace. Copy the **Bot User OAuth Token** (`xoxb-...`).
+4. In **Basic Information → App-Level Tokens**, generate a token with `connections:write`. Copy it (`xapp-...`).
+5. Add the bot to channels you want to use.
+6. Fill in `config.json` with `botToken`, `appToken`, `teamId`, `botUserId`, and channel IDs.
 
-Slack uses Socket Mode, so no public HTTP endpoint or Request URL is needed. The included manifest enables the App Home messages tab for DMs. Bot replies are threaded by default: pi-chat responds inside the triggering message's thread.
+Slack uses Socket Mode — no public HTTP endpoint needed.
 
-Required bot scopes/events are captured in `slack-app-manifest.yaml`; if you add scopes later, reinstall the Slack app before refreshing channels in `/chat-config`.
+### Discord
 
----
+1. Create a bot at [Discord Developer Portal](https://discord.com/developers/applications).
+2. Enable **Message Content Intent** under Bot settings.
+3. Invite the bot to a server.
+4. Fill in `config.json` with `botToken`, `applicationId`, `serverId`, `botUserId`, and channel IDs.
 
-## Commands
+### Telegram
 
-| Command | Description |
-|---------|-------------|
-| `/chat-config` | Configure accounts, channels, and secrets |
-| `/chat-connect` | Connect to a configured channel |
-| `/chat-disconnect` | Disconnect the current channel |
-| `/chat-status` | Show connection status, model, usage, context |
-| `/chat-list` | List configured channels |
-| `/chat-spawn-all` | Spawn every configured channel in detached tmux/pi sessions |
-| `/chat-spawn-all --restart` | Restart those tmux/pi sessions |
-| `/chat-workers` | Show managed tmux/pi worker status |
-| `/chat-open-all` | Open running workers in a tiled tmux dashboard |
-| `/chat-kill-all` | Kill all managed tmux/pi workers |
-| `/chat-new` | Start a new pi session, keeping the chat connection |
-
-Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. The `chat_workers` tool exposes the same status to an orchestrating pi agent.
+1. Create a bot via [@BotFather](https://t.me/BotFather). Copy the bot token.
+2. Fill in `config.json` with `botToken`, `botUsername`, and channel/group IDs.
 
 ---
 
-## Remote Control
+## Remote control
 
-Users in the connected chat can send these commands (with or without mentioning the bot):
+Any allowed user in a connected chat can send these commands (with or without @mentioning the bot):
 
 | Command | Effect |
-|---------|--------|
+|---|---|
 | `stop` | Abort the current turn |
-| `status` | Show model, usage, context stats |
-| `compact` | Trigger context compaction |
-| `new` | Start a new pi session |
+| `compact` | Compact the session context |
+| `status` | Show queue length, record count, and session ID |
 
 ---
 
-## Storage Layout
-
-Everything lives under `~/.pi/agent/chat/`:
+## Storage layout
 
 ```
 ~/.pi/agent/chat/
-├── config.json                          # Accounts, channels, secrets
-├── cache/                               # Discovery cache
+├── config.json
 └── accounts/<account>/
-    ├── shared/                          # Mounted as /shared in VM
-    │   ├── memory.md                    # Account-wide persistent memory
-    │   └── skills/                      # Account-wide skills
+    ├── shared/
+    │   ├── memory.md          # Account-wide persistent memory
+    │   └── skills/            # Account-wide skills
     └── channels/<channel>/
-        ├── channel.jsonl                # Chat log
-        ├── .lock                        # Runtime lock
-        ├── workspace/                   # Mounted as /workspace in VM
-        │   ├── memory.md                # Channel-specific persistent memory
-        │   ├── skills/                  # Channel-specific skills
-        │   ├── incoming/                # Downloaded attachments
-        │   ├── .secrets/                # Encrypted secrets
-        │   └── SYSTEM.md                # Environment modification log
-        └── gondolin/                    # VM state
-            └── session.json
+        ├── channel.jsonl      # Chat log
+        ├── .lock
+        └── workspace/
+            ├── memory.md      # Channel-specific persistent memory
+            ├── skills/        # Channel-specific skills
+            ├── incoming/      # Downloaded attachments
+            └── .secrets/      # Runtime secrets
 ```
 
----
-
-## VM Environment
-
-Each connection starts a Gondolin micro-VM with:
-
-- **Alpine Linux** with bash pre-installed
-- `/workspace` → channel workspace directory
-- `/shared` → account shared directory
-- Tools: `read`, `write`, `edit`, `bash`
-- All outbound HTTP/TLS open by default
-
-The agent sees `/workspace` as its working directory.
+The pi session for each channel is stored under `~/.pi/agent/sessions/` using the workspace dir as the cwd key. Sessions persist across daemon restarts — the agent remembers conversation context.
 
 ---
 
 ## Memory
 
-Two persistent memory files, injected into the system prompt on every turn:
+Two memory files are read before every agent turn and injected into the system prompt:
 
-| File | VM Path | Scope |
-|------|---------|-------|
-| Account memory | `/shared/memory.md` | Shared across all channels for this account |
-| Channel memory | `/workspace/memory.md` | Specific to this channel |
+| File | Scope |
+|---|---|
+| `shared/memory.md` | Account-wide — shared across all channels for this account |
+| `workspace/memory.md` | Channel-specific |
 
-The agent is instructed to write durable facts and preferences to these files when asked to remember something. Account-wide goes to `/shared/memory.md`, channel-specific to `/workspace/memory.md`.
+The agent writes durable facts and preferences here when asked to remember something.
 
 ---
 
 ## Skills
 
-The agent can create reusable tools as skills, following the [Agent Skills standard](https://agentskills.io):
-
-- **Account-wide:** `/shared/skills/`
-- **Channel-specific:** `/workspace/skills/`
-
-A skill is either a single `.md` file (e.g. `skills/foo.md`) or a directory with `SKILL.md` plus supporting files (e.g. `skills/foo/SKILL.md`, `skills/foo/run.sh`).
-
-Each skill needs YAML frontmatter:
+Skills are markdown files with YAML frontmatter discovered at startup and listed in the system prompt:
 
 ```yaml
 ---
-name: skill-name
-description: Short description of what this skill does
+name: my-skill
+description: What this skill does
 ---
+Instructions for the agent...
 ```
 
-Skills are automatically discovered and listed in the system prompt. The agent reads the full skill file before using it.
+- **Account-wide:** `shared/skills/` (or `shared/skills/<name>/SKILL.md`)
+- **Channel-specific:** `workspace/skills/`
 
----
-
-## Secrets
-
-### Config Secrets (Gondolin HTTP hooks)
-
-Configure secrets at three levels via `/chat-config`:
-
-- **Global** — shared across all accounts
-- **Per account** — shared across channels of that account
-- **Per channel** — specific to one channel
-
-Each secret has a value and allowed host patterns. Gondolin replaces placeholder env vars with real values only for outbound HTTP requests to allowed hosts. The agent never sees the real secret value.
-
-### Runtime Secrets (encrypted exchange)
-
-For credentials the agent needs at runtime (API keys for skills, OAuth files, etc.):
-
-1. Agent calls the `chat_request_secret` tool
-2. A link to `pi.dev/secret` is sent to the chat with an embedded public key
-3. User clicks, pastes the secret, and gets an encrypted blob
-4. User pastes the blob back into chat
-5. pi-chat decrypts it (RSA-OAEP + AES-256-GCM) and stores it at `/workspace/.secrets/<name>`
-6. Agent is notified and can use the file
-
-The encrypted blob is useless without the ephemeral private key held in pi-chat's memory.
+Channel skills override shared skills with the same name.
 
 ---
 
 ## Tools
 
 | Tool | Description |
-|------|-------------|
-| `read` | Read files (routed through Gondolin VM) |
-| `write` | Create/overwrite files |
-| `edit` | Precise in-place edits |
-| `bash` | Execute commands (runs `/bin/bash` in the VM) |
+|---|---|
+| `read` | Read files in the channel workspace |
+| `write` | Write files |
+| `edit` | In-place file edits |
+| `bash` | Run shell commands in the workspace |
 | `chat_history` | Search older messages from the chat log |
-| `chat_attach` | Queue files to send with the next reply |
-| `chat_request_secret` | Request a secret from the user via encrypted exchange |
+| `chat_attach` | Queue local files to send with the next reply |
 
----
-
-## Credits
-
-pi-chat includes vendored/adapted logic inspired by [Vercel Chat SDK](https://github.com/vercel/ai) (MIT):
-
-- `src/render/format.ts`
-- `src/render/streaming-markdown.ts`
-- `src/render/streaming.ts`
+Tools run on the host filesystem with `workspace/` as the working directory. On a dedicated VM this is safe by default; on a shared machine, consider access policies and `allowedUserIds`.
 
 ---
 
