@@ -192,12 +192,13 @@ async function runWorkerWithRuntime(
 	// deltas don't each create a new Slack message instead of editing one.
 	let currentText = "";
 	let previewPending: string | undefined;
+	let previewDone: Promise<void> = Promise.resolve();
 	let previewRunning = false;
 	function pushPreview(text: string): void {
 		previewPending = text;
 		if (previewRunning) return;
 		previewRunning = true;
-		void (async () => {
+		previewDone = (async () => {
 			while (previewPending !== undefined) {
 				const t = previewPending;
 				previewPending = undefined;
@@ -236,6 +237,8 @@ async function runWorkerWithRuntime(
 
 		try {
 			await session.prompt(next.prompt);
+			previewPending = undefined; // cancel any queued preview update
+			await previewDone; // wait for in-flight syncPreview to finish
 			await liveConnection?.clearPreview();
 			const text = currentText.trim();
 			const attachments = [...queuedAttachments];
@@ -248,6 +251,8 @@ async function runWorkerWithRuntime(
 			await runtime.completeActiveJob(text, remoteMessageId, attachments.length > 0 ? attachments : undefined);
 			log(conversation, "job complete");
 		} catch (error) {
+			previewPending = undefined;
+			await previewDone;
 			await liveConnection?.clearPreview();
 			const msg = error instanceof Error ? error.message : String(error);
 			log(conversation, `job failed: ${msg}`);
