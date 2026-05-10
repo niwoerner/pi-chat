@@ -221,6 +221,7 @@ export async function connectSlackLive(
 	const client = new WebClient(account.botToken);
 	const channelId = conversation.channel.id;
 	let currentThreadTs: string | undefined;
+	let currentReplyToTs: string | undefined;
 
 	const setThread = (ts: string | undefined) => {
 		// Don't thread in DM channels — Slack shows thread replies in the main
@@ -229,6 +230,14 @@ export async function connectSlackLive(
 			currentThreadTs = ts;
 		}
 	};
+
+	async function addReaction(ts: string, name: string): Promise<void> {
+		await client.reactions.add({ channel: channelId, timestamp: ts, name }).catch(() => undefined);
+	}
+
+	async function removeReaction(ts: string, name: string): Promise<void> {
+		await client.reactions.remove({ channel: channelId, timestamp: ts, name }).catch(() => undefined);
+	}
 
 	await catchUp(client, conversation, account, handlers, setThread, resumeState?.cursor);
 	await handlers.onCaughtUp();
@@ -278,10 +287,19 @@ export async function connectSlackLive(
 			if (attachmentPaths.length === 0) return sendSlackText(client, channelId, text, threadTs);
 			return sendSlackAttachments(client, channelId, text, attachmentPaths, threadTs);
 		},
-		startTyping: async () => {},
-		stopTyping: async () => {},
+		startTyping: async () => {
+			if (currentReplyToTs) await addReaction(currentReplyToTs, "hourglass_flowing_sand");
+		},
+		stopTyping: async () => {
+			if (!currentReplyToTs) return;
+			await removeReaction(currentReplyToTs, "hourglass_flowing_sand");
+			await addReaction(currentReplyToTs, "rose");
+		},
 		syncPreview: async () => [],
 		clearPreview: async () => {},
-		setReplyTo: (messageId) => setThread(messageId),
+		setReplyTo: (messageId) => {
+			currentReplyToTs = messageId;
+			setThread(messageId);
+		},
 	};
 }
