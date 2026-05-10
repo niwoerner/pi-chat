@@ -188,12 +188,32 @@ async function runWorkerWithRuntime(
 
 	signal.addEventListener("abort", () => void session.abort(), { once: true });
 
-	// Accumulate streamed text during a turn and stream preview to chat
+	// Accumulate streamed text and stream preview — serialized so concurrent
+	// deltas don't each create a new Slack message instead of editing one.
 	let currentText = "";
+	let previewPending: string | undefined;
+	let previewRunning = false;
+	function pushPreview(text: string): void {
+		previewPending = text;
+		if (previewRunning) return;
+		previewRunning = true;
+		void (async () => {
+			while (previewPending !== undefined) {
+				const t = previewPending;
+				previewPending = undefined;
+				try {
+					await liveConnection?.syncPreview(t);
+				} catch {
+					// ignore preview errors
+				}
+			}
+			previewRunning = false;
+		})();
+	}
 	session.subscribe((event) => {
 		if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
 			currentText += event.assistantMessageEvent.delta;
-			void liveConnection?.syncPreview(currentText);
+			pushPreview(currentText);
 		}
 	});
 
