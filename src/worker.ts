@@ -188,11 +188,12 @@ async function runWorkerWithRuntime(
 
 	signal.addEventListener("abort", () => void session.abort(), { once: true });
 
-	// Accumulate streamed text during a turn
+	// Accumulate streamed text during a turn and stream preview to chat
 	let currentText = "";
 	session.subscribe((event) => {
 		if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
 			currentText += event.assistantMessageEvent.delta;
+			void liveConnection?.syncPreview(currentText);
 		}
 	});
 
@@ -215,6 +216,7 @@ async function runWorkerWithRuntime(
 
 		try {
 			await session.prompt(next.prompt);
+			await liveConnection?.clearPreview();
 			const text = currentText.trim();
 			const attachments = [...queuedAttachments];
 			queuedAttachments = [];
@@ -226,6 +228,7 @@ async function runWorkerWithRuntime(
 			await runtime.completeActiveJob(text, remoteMessageId, attachments.length > 0 ? attachments : undefined);
 			log(conversation, "job complete");
 		} catch (error) {
+			await liveConnection?.clearPreview();
 			const msg = error instanceof Error ? error.message : String(error);
 			log(conversation, `job failed: ${msg}`);
 			await runtime.failActiveJob(msg);

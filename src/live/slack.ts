@@ -248,10 +248,10 @@ export async function connectSlackLive(
 			await handlers.onError(error instanceof Error ? error : new Error(String(error)));
 		}
 	};
-	socketClient.on("message", onMessage);
-	// DEBUG: log all socket events to diagnose missing live messages
-	socketClient.on("slack_event", (payload: unknown) => {
-		console.log(`[slack-debug] slack_event:`, JSON.stringify(payload).slice(0, 400));
+	socketClient.on("slack_event", async ({ body, ack }: { body: { event?: SlackMessageEvent }; ack: () => Promise<void> }) => {
+		const event = body?.event;
+		if (!event || event.type !== "message") return;
+		await onMessage({ event, ack });
 	});
 	await socketClient.start();
 	return {
