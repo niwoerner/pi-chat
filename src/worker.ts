@@ -95,7 +95,7 @@ export async function runWorker(conversation: ResolvedConversation, signal: Abor
 	await mkdir(conversation.sharedDir, { recursive: true });
 	await mkdir(conversation.filesDir, { recursive: true });
 
-	const ownerId = `daemon-${process.pid}-${randomUUID()}`;
+	const ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	const runtime = await ConversationRuntime.connect(conversation, ownerId);
 
 	let liveConnection: LiveConnection | undefined;
